@@ -1,0 +1,21 @@
+/build/
+/out/
+/.vs/
+*.user
+CMakeUserPresets.json
+CMakePresets.json
+
+# Local library. Tracks, the database and cached covers stay on this machine.
+*.db
+*.db-wal
+*.db-shm
+/covers/
+*.mp3
+*.flac
+*.fla
+*.wav
+*.m4a
+*.ogg
+*.jpg
+*.jpeg
+*.png
