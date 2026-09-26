@@ -14,6 +14,9 @@ public:
     void setVolume(qreal fraction01);
     void applyUiScale(qreal scale) override;
     void fitWithin(qreal maxWidth, qreal maxHeight) override;
+    bool canResize() const override { return true; }
+    bool resizeKeepsRatio() const override { return false; }
+    void resizeTo(qreal width, qreal height) override;
 
 signals:
     void volumeRequested(qreal fraction01);
@@ -32,6 +35,7 @@ private:
 
     qreal m_volume = 0.8;
     qreal m_width = 220.0;
+    qreal m_fitScale = 0;
     qreal m_barHeight = 8.0;
     qreal m_fontPx = 13.0;
     QColor m_accent{"#c9974b"};

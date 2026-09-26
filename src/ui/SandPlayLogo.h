@@ -1,11 +1,15 @@
 #pragma once
 
 #include <QIcon>
+#include <QLineF>
 #include <QPainter>
-#include <QPixmap>
-#include <QPolygonF>
+#include <QPainterPath>
+#include <QPen>
+#include <algorithm>
+#include <cmath>
 
-// Right-pointing triangle with sand spilling off it. Color is the project terracotta.
+// Pastel orange triangle pointing right, with a soft white edge. Three lighter
+// grains sit on a straight line under the lower edge.
 inline QPixmap sandPlayLogoPixmap(int side)
 {
     QPixmap pm(side, side);
@@ -13,26 +17,63 @@ inline QPixmap sandPlayLogoPixmap(int side)
     QPainter painter(&pm);
     painter.setRenderHint(QPainter::Antialiasing);
     const qreal s = side / 64.0;
-    const QColor sand(QStringLiteral("#d97757"));
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(sand);
-    QPolygonF triangle;
-    triangle << QPointF(9 * s, 7 * s) << QPointF(9 * s, 39 * s) << QPointF(48 * s, 23 * s);
-    painter.drawPolygon(triangle);
 
-    struct Grain { qreal x, y, r, alpha; };
-    const Grain grains[] = {
-        {16, 43, 2.0, 0.95}, {26, 45, 1.6, 0.9},  {36, 44, 1.8, 0.85},
-        {46, 34, 1.5, 0.9},  {50, 42, 1.3, 0.75}, {20, 50, 1.4, 0.7},
-        {30, 52, 1.7, 0.65}, {40, 51, 1.2, 0.6},  {12, 54, 1.1, 0.5},
-        {24, 57, 1.0, 0.45}, {44, 56, 1.3, 0.5},  {34, 59, 0.9, 0.4},
-        {52, 50, 1.0, 0.45}, {18, 61, 0.8, 0.35}, {48, 60, 0.75, 0.3},
+    const QPointF corners[] = {
+        QPointF(11 * s, 9 * s),
+        QPointF(11 * s, 44 * s),
+        QPointF(48 * s, 26.5 * s),
     };
-    for (const Grain &grain : grains) {
-        QColor color = sand;
-        color.setAlphaF(grain.alpha);
-        painter.setBrush(color);
-        painter.drawEllipse(QPointF(grain.x * s, grain.y * s), grain.r * s, grain.r * s);
+    const qreal radius = 5.5 * s;
+    QPainterPath triangle;
+    for (int i = 0; i < 3; ++i) {
+        const QPointF curr = corners[i];
+        const QPointF prev = corners[(i + 2) % 3];
+        const QPointF next = corners[(i + 1) % 3];
+        QLineF inbound(curr, prev);
+        QLineF outbound(curr, next);
+        const qreal r = std::min(radius, std::min(inbound.length(), outbound.length()) * 0.42);
+        inbound.setLength(r);
+        outbound.setLength(r);
+        if (i == 0) triangle.moveTo(inbound.p2());
+        else triangle.lineTo(inbound.p2());
+        triangle.quadTo(curr, outbound.p2());
+    }
+    triangle.closeSubpath();
+
+    const QPen round(Qt::white, 1.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    QPen glow = round;
+    glow.setWidthF(6.2 * s);
+    glow.setColor(QColor(255, 255, 255, 80));
+    painter.setPen(glow);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawPath(triangle);
+
+    QPen edge = round;
+    edge.setWidthF(2.2 * s);
+    edge.setColor(Qt::white);
+    painter.setPen(edge);
+    painter.setBrush(QColor(QStringLiteral("#f6b48a")));
+    painter.drawPath(triangle);
+
+    // Parallel to the lower edge, dropped clear of it.
+    const QPointF edgeStart = corners[1];
+    const QPointF along = corners[2] - edgeStart;
+    const qreal alongLen = std::hypot(along.x(), along.y());
+    const QPointF dir = along / alongLen;
+    const QPointF down(dir.y(), -dir.x());
+    const QPointF outward = down.y() > 0 ? down : QPointF(-down.x(), -down.y());
+    const qreal grain = 3.3 * s;
+    const qreal gap = 8.2 * s;
+    const qreal steps[] = {0.31, 0.58, 0.85};
+
+    QPen grainEdge = round;
+    grainEdge.setWidthF(1.7 * s);
+    grainEdge.setColor(QColor(QStringLiteral("#e39a78")));
+    painter.setPen(grainEdge);
+    painter.setBrush(QColor(QStringLiteral("#f8c7a6")));
+    for (qreal t : steps) {
+        const QPointF center = edgeStart + along * t + outward * gap;
+        painter.drawEllipse(center, grain, grain);
     }
     return pm;
 }

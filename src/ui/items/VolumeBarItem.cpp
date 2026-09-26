@@ -85,10 +85,24 @@ void VolumeBarItem::setVolume(qreal fraction01)
 void VolumeBarItem::applyUiScale(qreal scale)
 {
     prepareGeometryChange();
-    m_width = std::clamp(240.0 * scale, 180.0, 360.0);
-    m_barHeight = std::clamp(8.0 * scale, 6.0, 12.0);
-    m_fontPx = std::clamp(13.0 * scale, 11.0, 18.0);
+    m_fitScale = scale;
+    const qreal sized = scale * itemScale();
+    m_width = std::clamp(240.0 * sized, 120.0, 760.0);
+    m_barHeight = std::clamp(8.0 * sized, 5.0, 22.0);
+    m_fontPx = std::clamp(13.0 * sized, 10.0, 28.0);
     update();
+}
+
+void VolumeBarItem::resizeTo(qreal width, qreal)
+{
+    prepareGeometryChange();
+    if (m_fitScale < 0.05) {
+        m_width = std::clamp(width, 120.0, 760.0);
+        update();
+        return;
+    }
+    setItemScale(width / (240.0 * m_fitScale));
+    applyUiScale(m_fitScale);
 }
 
 void VolumeBarItem::fitWithin(qreal maxWidth, qreal)

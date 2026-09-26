@@ -36,13 +36,25 @@
 #include <QFileInfo>
 #include <QLabel>
 #include <QPushButton>
+#include <QToolButton>
+#include <QFont>
+#include <QFontComboBox>
+#include <QFontDatabase>
+#include <QPainterPath>
+#include <QSizePolicy>
+#include <QComboBox>
 #include <QScrollBar>
 #include <QSlider>
 #include <QWidgetAction>
 #include <QDir>
 #include <QImage>
 #include <QStandardPaths>
-#include <QToolButton>
+#include <QSettings>
+#include <QDirIterator>
+#include <QFrame>
+#include <QComboBox>
+#include "SmoothScroll.h"
+#include "SettingsDialog.h"
 #include <QTimer>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
@@ -60,8 +72,76 @@
 #include <QResizeEvent>
 #include <algorithm>
 #include <functional>
+#include <iterator>
+
+class TourShade : public QWidget {
+public:
+    explicit TourShade(QWidget *parent) : QWidget(parent) {}
+
+    void setHole(const QRect &area, const QRect &hole)
+    {
+        setGeometry(area);
+        m_hole = hole;
+        QRegion mask(QRect(QPoint(0, 0), area.size()));
+        if (hole.isValid()) mask -= hole;
+        setMask(mask);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(6, 8, 12, 88));
+        const QRect area = rect();
+        const QRect hole = m_hole;
+        painter.drawRect(QRect(area.left(), area.top(), area.width(), hole.top()));
+        painter.drawRect(QRect(area.left(), hole.bottom(), area.width(), area.bottom() - hole.bottom()));
+        painter.drawRect(QRect(area.left(), hole.top(), hole.left(), hole.height()));
+        painter.drawRect(QRect(hole.right(), hole.top(), area.right() - hole.right(), hole.height()));
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(QColor(QStringLiteral("#c9974b")), 2));
+        painter.drawRoundedRect(hole.adjusted(1, 1, -2, -2), 12, 12);
+    }
+
+private:
+    QRect m_hole;
+};
 
 namespace {
+
+QString libraryRootPath()
+{
+    QSettings settings;
+    const QString saved = settings.value(QStringLiteral("library/root")).toString();
+    if (!saved.isEmpty() && QDir(saved).exists())
+        return QDir(saved).absolutePath();
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).absolutePath();
+}
+
+bool copyTree(const QString &fromDir, const QString &toDir)
+{
+    QDir source(fromDir);
+    if (!source.exists()) return true;
+    QDirIterator it(fromDir, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString sourcePath = it.next();
+        const QString relative = source.relativeFilePath(sourcePath);
+        const QString destPath = QDir(toDir).filePath(relative);
+        QDir().mkpath(QFileInfo(destPath).absolutePath());
+        if (QFile::exists(destPath)) QFile::remove(destPath);
+        if (!QFile::copy(sourcePath, destPath)) return false;
+    }
+    return true;
+}
+
+void removeTree(const QString &dirPath)
+{
+    QDir dir(dirPath);
+    if (dir.exists()) dir.removeRecursively();
+}
 
 class PixmapSlide : public QWidget {
 public:
@@ -110,6 +190,23 @@ QPixmap renderPanelFrame(PlayerPanel *panel, const QRect &target, bool offscreen
     return shot;
 }
 
+QColor gSelection{QStringLiteral("#3a3428")};
+
+QColor mutedSelection(const QColor &accent)
+{
+    const QColor surface(27, 30, 39);
+    QColor mixed((accent.red() * 2 + surface.red() * 3) / 5,
+                 (accent.green() * 2 + surface.green() * 3) / 5,
+                 (accent.blue() * 2 + surface.blue() * 3) / 5);
+    int hue = 0;
+    int sat = 0;
+    int value = 0;
+    mixed.getHsv(&hue, &sat, &value);
+    if (hue < 0) hue = std::max(0, accent.hsvHue());
+    mixed.setHsv(hue, std::clamp(sat * 3 / 5, 32, 80), std::clamp(value, 50, 84));
+    return mixed;
+}
+
 class TrackCoverDelegate : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
@@ -117,8 +214,7 @@ public:
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
         const bool selected = option.state.testFlag(QStyle::State_Selected);
-        painter->fillRect(option.rect, QColor(selected ? QStringLiteral("#3a3428")
-                                                       : QStringLiteral("#1b1e27")));
+        painter->fillRect(option.rect, selected ? gSelection : QColor(QStringLiteral("#1b1e27")));
         if (index.column() == TrackTableModel::ColCover) {
             const int side = std::min(option.rect.width(), option.rect.height()) - 16;
             if (side < 8) return;
@@ -167,7 +263,7 @@ public:
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
         const bool selected = option.state.testFlag(QStyle::State_Selected);
-        painter->fillRect(option.rect, QColor(selected ? QStringLiteral("#3a3428") : QStringLiteral("#1b1e27")));
+        painter->fillRect(option.rect, selected ? gSelection : QColor(QStringLiteral("#1b1e27")));
         QStyleOptionViewItem opt(option);
         initStyleOption(&opt, index);
         painter->save();
@@ -374,42 +470,10 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
 {
     setWindowTitle(QStringLiteral("SandPlay"));
     resize(1100, 760);
-    setStyleSheet(QStringLiteral(R"(
-        QWidget { background: #14161c; color: #ece8e0; }
-        QTableView, QListView, QLineEdit {
-            background: #1b1e27; color: #ece8e0;
-            border: 1px solid #2a2e3a; border-radius: 6px;
-            selection-background-color: #3a3428; selection-color: #f3efe6;
-        }
-        QHeaderView::section {
-            background: #1b1e27; color: #8b8a86; border: none;
-            border-right: 1px solid #2a2e3a; border-bottom: 1px solid #2a2e3a;
-            padding: 8px 12px;
-        }
-        QTableView#libraryTable {
-            border: none; border-radius: 0px; background: #1b1e27;
-            selection-background-color: #3a3428; selection-color: #f3efe6;
-        }
-        QListView::item:selected {
-            background-color: #3a3428; color: #f3efe6;
-        }
-        QPushButton {
-            background: #242833; color: #ece8e0;
-            border: 1px solid #2a2e3a; border-radius: 6px; padding: 6px 10px;
-        }
-        QPushButton:hover { border-color: #c9974b; }
-        QPushButton:checked { background: #c9974b; color: #14161c; }
-        QSplitter::handle { background: #2a2e3a; }
-        QGraphicsView { background: #1b1e27; border: none; }
-        QStatusBar { color: #8b8a86; }
-        #playerPanel, #playerLogo, #playerGutter, #playerTop, #playerQueue { background: #181b22; border: none; }
-        #logoStrip { background: #14161c; border: none; }
-        #appLogo { background: transparent; border: none; border-radius: 12px; }
-        #appLogo:hover { background: #242833; }
-        #miniBar { background: #1b1e27; border-top: 1px solid #2a2e3a; }
-    )"));
+    applyWindowChrome();
 
     auto *addButton = new QPushButton(tr("+ Добавить трек"));
+    m_addButton = addButton;
     auto *importButton = new QPushButton(tr("+ Импорт папки"));
     auto *libraryButton = new QPushButton(tr("Вся библиотека"));
     auto *newPlaylistButton = new QPushButton(tr("+ Новый плейлист"));
@@ -533,6 +597,7 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     auto *miniBar = new QWidget;
     miniBar->setObjectName(QStringLiteral("miniBar"));
     miniBar->setLayout(miniLayout);
+    m_miniBar = miniBar;
 
     auto *logoButton = new QToolButton;
     logoButton->setObjectName(QStringLiteral("appLogo"));
@@ -541,6 +606,7 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     logoButton->setAutoRaise(true);
     logoButton->setCursor(Qt::PointingHandCursor);
     logoButton->setIcon(sandPlayLogoIcon());
+    m_settingsButton = logoButton;
     auto *logoStrip = new QWidget;
     logoStrip->setObjectName(QStringLiteral("logoStrip"));
     logoStrip->setFixedHeight(64);
@@ -640,7 +706,17 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     connect(m_panel, &PlayerPanel::queueRatioChanged, this, [this](qreal ratio) {
         m_db.setSetting(QStringLiteral("queue_ratio"), QString::number(ratio, 'f', 3));
     });
-    connect(logoButton, &QToolButton::clicked, this, &MainWindow::openLogoMenu);
+    connect(logoButton, &QToolButton::clicked, this, &MainWindow::openSettings);
+    connect(m_trackView->horizontalHeader(), &QHeaderView::sectionResized, this,
+            [this](int section, int, int newSize) {
+                if (section == TrackTableModel::ColTitle && newSize >= 80)
+                    m_db.setSetting(QStringLiteral("col_title"), QString::number(newSize));
+            });
+    new SmoothScroller(m_trackView);
+    new SmoothScroller(m_playlistView);
+    if (m_panel->queueView()) new SmoothScroller(m_panel->queueView());
+    if (m_db.getSetting(QStringLiteral("tour_done")).isEmpty())
+        QTimer::singleShot(500, this, &MainWindow::startTour);
 
     connect(&m_queue, &PlaybackQueue::currentChanged, this, &MainWindow::onQueueCurrentChanged);
     connect(&m_queue, &PlaybackQueue::queueChanged, this, [this]() {
@@ -677,6 +753,15 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     const auto repeatMode = static_cast<PlaybackQueue::RepeatMode>(repeat);
     m_queue.setRepeatMode(repeatMode);
     m_panel->setRepeatMode(repeatMode);
+
+    const QString fontFile = m_db.getSetting(QStringLiteral("ui_font_file"));
+    if (!fontFile.isEmpty() && QFile::exists(fontFile))
+        QFontDatabase::addApplicationFont(fontFile);
+    m_uiFontFamily = m_db.getSetting(QStringLiteral("ui_font"));
+    m_uiFontSize = std::clamp(m_db.getSetting(QStringLiteral("ui_font_size"), QStringLiteral("10")).toInt(), 9, 18);
+    m_buttonStyle = std::clamp(m_db.getSetting(QStringLiteral("ui_button_style"), QStringLiteral("0")).toInt(), 0, 2);
+    const int titleWidth = m_db.getSetting(QStringLiteral("col_title")).toInt();
+    if (titleWidth >= 140) m_trackView->setColumnWidth(TrackTableModel::ColTitle, titleWidth);
 
     QColor accent(m_db.getSetting(QStringLiteral("accent"), QStringLiteral("#c9974b")));
     if (!accent.isValid()) accent = QColor(QStringLiteral("#c9974b"));
@@ -862,6 +947,7 @@ void MainWindow::setPlayerOpen(bool open)
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
+    if (m_tour && m_tour->isVisible()) placeTour();
     if (!m_splitRestored && m_librarySplit && m_librarySplit->width() > 420) {
         m_splitRestored = true;
         const int total = m_librarySplit->width();
@@ -888,6 +974,14 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    if (event->type() == QEvent::Wheel) {
+        auto *widget = qobject_cast<QWidget *>(watched);
+        auto *combo = qobject_cast<QComboBox *>(widget);
+        if (!combo && widget)
+            combo = qobject_cast<QComboBox *>(widget->parentWidget());
+        if (combo && combo->view() && !combo->view()->isVisible())
+            return true;
+    }
     if (m_librarySplit && watched == m_librarySplit->handle(1)
         && event->type() == QEvent::MouseButtonDblClick) {
         const int total = std::max(m_librarySplit->width(), 480);
@@ -970,36 +1064,436 @@ bool MainWindow::handlePlayerKey(QKeyEvent *event)
 void MainWindow::applyAccent(const QColor &color)
 {
     m_accent = color;
-    m_playPauseItem->setAccent(color);
-    m_seekItem->setAccent(color);
-    m_panel->setAccent(color);
+    if (m_canvas) m_canvas->applyAccent(color);
+    if (m_panel) m_panel->setAccent(color);
+    applyWindowChrome();
 }
 
-void MainWindow::openLogoMenu()
+void MainWindow::applyWindowChrome()
 {
-    QMenu menu(this);
-    auto *editButton = new QPushButton(tr("Редактировать плеер"), &menu);
-    editButton->setCursor(Qt::PointingHandCursor);
-    editButton->setStyleSheet(QStringLiteral("text-align: left; padding: 8px 16px;"));
-    auto *edit = new QWidgetAction(&menu);
-    edit->setDefaultWidget(editButton);
-    menu.addAction(edit);
-    connect(editButton, &QPushButton::clicked, edit, &QAction::trigger);
-
-    QAction *color = menu.addAction(tr("Цвет кнопок и полос…"));
-    menu.addSeparator();
-    QAction *eq = menu.addAction(tr("Эквалайзер…"));
-
-    QAction *chosen = menu.exec(QCursor::pos());
-    if (chosen == edit) openPlayerEditor();
-    else if (chosen == color) {
-        const QColor picked = QColorDialog::getColor(m_accent, this, tr("Цвет плеера"));
-        if (!picked.isValid()) return;
-        applyAccent(picked);
-        m_db.setSetting(QStringLiteral("accent"), picked.name(QColor::HexRgb));
-    } else if (chosen == eq) {
-        openEqualizer();
+    gSelection = mutedSelection(m_accent.isValid() ? m_accent : QColor(QStringLiteral("#c9974b")));
+    const QString accent = m_accent.isValid() ? m_accent.name(QColor::HexRgb) : QStringLiteral("#c9974b");
+    const QString selection = gSelection.name(QColor::HexRgb);
+    QString buttons;
+    if (m_buttonStyle == 1) {
+        buttons = QStringLiteral(
+            "QPushButton { background: %1; color: #14161c; border: none; border-radius: 6px; padding: 6px 10px; }"
+            "QPushButton:hover { background: %1; }").arg(accent);
+    } else if (m_buttonStyle == 2) {
+        buttons = QStringLiteral(
+            "QPushButton { background: transparent; color: #ece8e0; border: none; border-radius: 6px; padding: 6px 10px; }"
+            "QPushButton:hover { color: %1; }").arg(accent);
+    } else {
+        buttons = QStringLiteral(
+            "QPushButton { background: #242833; color: #ece8e0; border: 1px solid %1; border-radius: 6px; padding: 6px 10px; }"
+            "QPushButton:hover { background: #2e3340; border-color: %1; }").arg(accent);
     }
+    setStyleSheet(QString(QStringLiteral(R"(
+        QWidget { background: #14161c; color: #ece8e0; }
+        QTableView, QListView, QLineEdit {
+            background: #1b1e27; color: #ece8e0;
+            border: 1px solid #2a2e3a; border-radius: 6px;
+            selection-background-color: #3a3428; selection-color: #f3efe6;
+        }
+        QHeaderView::section {
+            background: #1b1e27; color: #8b8a86; border: none;
+            border-right: 1px solid #2a2e3a; border-bottom: 1px solid #2a2e3a;
+            padding: 8px 12px;
+        }
+        QTableView#libraryTable {
+            border: none; border-radius: 0px; background: #1b1e27;
+            selection-background-color: #3a3428; selection-color: #f3efe6;
+        }
+        QListView::item:selected { background-color: #3a3428; color: #f3efe6; }
+        QPushButton:checked { color: #14161c; }
+        QSplitter::handle { background: #2a2e3a; }
+        QGraphicsView { background: #1b1e27; border: none; }
+        QStatusBar { color: #8b8a86; }
+        #playerPanel, #playerLogo, #playerGutter, #playerTop { background: #181b22; border: none; }
+        #playerPanel QSplitter, #playerQueue { background: transparent; border: none; }
+        #queueCard { background: #2a3142; border: none; border-radius: 18px; }
+        #queueCard[photo="true"] { background: rgba(42, 49, 66, 170); }
+        #queueCard QListView, #queueCard QListView::viewport, #queueCard QLabel {
+            background: transparent; border: none; border-radius: 0px;
+        }
+        #logoStrip { background: #14161c; border: none; }
+        #appLogo { background: transparent; border: none; border-radius: 12px; }
+        #appLogo:hover { background: #242833; }
+        #tourCard { background: #242833; border: 1px solid #c9974b; border-radius: 12px; }
+        #tourCard QLabel { color: #f3efe6; background: transparent; }
+        #miniBar { background: #1b1e27; border-top: 1px solid #2a2e3a; }
+    )")).replace(QStringLiteral("#3a3428"), selection) + buttons);
+
+    const auto paintSelection = [](QAbstractItemView *view) {
+        if (!view) return;
+        QPalette palette = view->palette();
+        palette.setColor(QPalette::Highlight, gSelection);
+        palette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#f3efe6")));
+        view->setPalette(palette);
+        view->viewport()->setPalette(palette);
+        view->viewport()->update();
+    };
+    paintSelection(m_trackView);
+    paintSelection(m_playlistView);
+    if (m_panel) paintSelection(m_panel->queueView());
+
+    if (!m_librarySplit) return;
+    QFont font = m_librarySplit->font();
+    if (!m_uiFontFamily.isEmpty()) font.setFamily(m_uiFontFamily);
+    font.setPointSize(std::clamp(m_uiFontSize, 9, 18));
+    const auto widgets = m_librarySplit->findChildren<QWidget *>();
+    m_librarySplit->setFont(font);
+    for (QWidget *widget : widgets) widget->setFont(font);
+}
+
+void MainWindow::openSettings()
+{
+    enum class FollowUp { None, Editor, Window, Equalizer, Tour };
+    FollowUp follow = FollowUp::None;
+    {
+        SettingsDialog dialog(m_audio.sampleRate(), m_audio.bitDepth(), libraryRootPath(), this);
+        connect(&dialog, &SettingsDialog::editPlayerRequested, this, [&]() {
+            follow = FollowUp::Editor;
+            dialog.accept();
+        });
+        connect(&dialog, &SettingsDialog::editWindowRequested, this, [&]() {
+            follow = FollowUp::Window;
+            dialog.accept();
+        });
+        connect(&dialog, &SettingsDialog::accentRequested, this, [this]() {
+            const QColor picked = QColorDialog::getColor(m_accent, this, tr("Цвет плеера"));
+            if (!picked.isValid()) return;
+            applyAccent(picked);
+            m_db.setSetting(QStringLiteral("accent"), picked.name(QColor::HexRgb));
+        });
+        connect(&dialog, &SettingsDialog::equalizerRequested, this, [&]() {
+            follow = FollowUp::Equalizer;
+            dialog.accept();
+        });
+        connect(&dialog, &SettingsDialog::outputChanged, this, [this, &dialog](int sampleRate, int bitDepth) {
+            const int previousRate = m_audio.sampleRate();
+            const int previousDepth = m_audio.bitDepth();
+            if (!m_audio.configureOutput(sampleRate, bitDepth)) {
+                dialog.setOutput(previousRate, previousDepth);
+                QMessageBox::warning(this, tr("Звучание"),
+                                     tr("Устройство не приняло этот формат. Оставлен прежний вывод."));
+                return;
+            }
+            m_db.setSetting(QStringLiteral("sample_rate"), QString::number(m_audio.sampleRate()));
+            m_db.setSetting(QStringLiteral("bit_depth"), QString::number(m_audio.bitDepth()));
+        });
+        connect(&dialog, &SettingsDialog::libraryChangeRequested, this, [this, &dialog]() {
+            if (chooseLibraryDirectory()) dialog.setLibraryPath(libraryRootPath());
+        });
+        connect(&dialog, &SettingsDialog::tourRequested, this, [&]() {
+            follow = FollowUp::Tour;
+            dialog.accept();
+        });
+        dialog.exec();
+    }
+    if (follow == FollowUp::Editor) openPlayerEditor();
+    else if (follow == FollowUp::Window) openWindowEditor();
+    else if (follow == FollowUp::Equalizer) openEqualizer();
+    else if (follow == FollowUp::Tour) startTour();
+}
+
+bool MainWindow::adoptFontFile(const QString &path)
+{
+    const QString fontsDir = libraryRootPath() + QStringLiteral("/fonts");
+    QDir().mkpath(fontsDir);
+    const QString dest = QDir(fontsDir).filePath(QFileInfo(path).fileName());
+    if (QFileInfo(path).absoluteFilePath().compare(QFileInfo(dest).absoluteFilePath(), Qt::CaseInsensitive) != 0) {
+        if (QFile::exists(dest)) QFile::remove(dest);
+        if (!QFile::copy(path, dest)) {
+            QMessageBox::warning(this, tr("Шрифт"), tr("Не удалось скопировать файл шрифта."));
+            return false;
+        }
+    }
+    const int id = QFontDatabase::addApplicationFont(dest);
+    const QStringList families = QFontDatabase::applicationFontFamilies(id);
+    if (id < 0 || families.isEmpty()) {
+        QMessageBox::warning(this, tr("Шрифт"), tr("Этот файл не удалось открыть как шрифт."));
+        return false;
+    }
+    m_uiFontFamily = families.first();
+    m_db.setSetting(QStringLiteral("ui_font"), m_uiFontFamily);
+    m_db.setSetting(QStringLiteral("ui_font_file"), dest);
+    applyWindowChrome();
+    return true;
+}
+
+void MainWindow::openWindowEditor()
+{
+    if (!m_librarySplit) return;
+    auto *hostLayout = qobject_cast<QVBoxLayout *>(m_librarySplit->parentWidget()
+                                                       ? m_librarySplit->parentWidget()->layout() : nullptr);
+    const int index = hostLayout ? hostLayout->indexOf(m_librarySplit) : -1;
+    const QSize liveSize = m_librarySplit->size();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Редактировать окно"));
+    auto *root = new QVBoxLayout(&dialog);
+    auto *hint = new QLabel(tr("Тяните границу колонок и заголовки таблицы — размер меняется сразу."));
+    hint->setWordWrap(true);
+    root->addWidget(hint);
+
+    auto *toolRow = new QHBoxLayout;
+    auto *styleBox = new QComboBox;
+    styleBox->addItem(tr("Кнопки: контур"), 0);
+    styleBox->addItem(tr("Кнопки: заливка"), 1);
+    styleBox->addItem(tr("Кнопки: без рамки"), 2);
+    styleBox->setCurrentIndex(std::clamp(m_buttonStyle, 0, 2));
+    auto *sizeBox = new QComboBox;
+    for (int size = 9; size <= 18; ++size)
+        sizeBox->addItem(tr("Размер %1").arg(size), size);
+    const int sizeIndex = sizeBox->findData(m_uiFontSize);
+    sizeBox->setCurrentIndex(sizeIndex >= 0 ? sizeIndex : 1);
+    auto *fontBox = new QFontComboBox;
+    fontBox->setCurrentFont(QFont(m_uiFontFamily.isEmpty() ? font().family() : m_uiFontFamily));
+    auto *otherFont = new QPushButton(tr("Другой шрифт"));
+    otherFont->setCursor(Qt::PointingHandCursor);
+    toolRow->addWidget(styleBox);
+    toolRow->addWidget(sizeBox);
+    toolRow->addWidget(fontBox, 1);
+    toolRow->addWidget(otherFont);
+    root->addLayout(toolRow);
+
+    connect(fontBox, &QFontComboBox::currentFontChanged, this, [this](const QFont &chosen) {
+        m_uiFontFamily = chosen.family();
+        m_db.setSetting(QStringLiteral("ui_font"), m_uiFontFamily);
+        applyWindowChrome();
+    });
+    connect(otherFont, &QPushButton::clicked, this, [this, fontBox]() {
+        const QString path = QFileDialog::getOpenFileName(
+            this, tr("Шрифт"), {}, tr("Шрифты (*.ttf *.otf *.ttc)"));
+        if (path.isEmpty() || !adoptFontFile(path)) return;
+        fontBox->blockSignals(true);
+        fontBox->setCurrentFont(QFont(m_uiFontFamily));
+        fontBox->blockSignals(false);
+    });
+    connect(sizeBox, &QComboBox::currentIndexChanged, this, [this, sizeBox]() {
+        m_uiFontSize = sizeBox->currentData().toInt();
+        m_db.setSetting(QStringLiteral("ui_font_size"), QString::number(m_uiFontSize));
+        applyWindowChrome();
+    });
+    connect(styleBox, &QComboBox::currentIndexChanged, this, [this, styleBox]() {
+        m_buttonStyle = styleBox->currentData().toInt();
+        m_db.setSetting(QStringLiteral("ui_button_style"), QString::number(m_buttonStyle));
+        applyWindowChrome();
+    });
+
+    m_librarySplit->setParent(nullptr);
+    if (liveSize.width() > 80 && liveSize.height() > 80)
+        m_librarySplit->setMinimumSize(liveSize);
+    root->addWidget(m_librarySplit, 1);
+
+    auto *done = new QPushButton(tr("Готово"));
+    connect(done, &QPushButton::clicked, &dialog, &QDialog::accept);
+    root->addWidget(done, 0, Qt::AlignRight);
+    dialog.adjustSize();
+
+    const auto putBack = [&]() {
+        m_librarySplit->setParent(nullptr);
+        m_librarySplit->setMinimumSize(0, 0);
+        m_librarySplit->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        if (hostLayout && index >= 0)
+            hostLayout->insertWidget(index, m_librarySplit, 1);
+    };
+    struct Restore {
+        std::function<void()> fn;
+        ~Restore() { if (fn) fn(); }
+    } restore{putBack};
+
+    dialog.exec();
+    restore.fn();
+    restore.fn = nullptr;
+}
+
+void MainWindow::startTour()
+{
+    const bool closing = m_panelOpen;
+    if (closing) setPlayerOpen(false);
+    if (!m_tour) {
+        m_tour = new QFrame(this);
+        m_tour->setObjectName(QStringLiteral("tourCard"));
+        m_tour->setFixedWidth(340);
+        auto *layout = new QVBoxLayout(m_tour);
+        layout->setContentsMargins(16, 14, 16, 14);
+        m_tourTitle = new QLabel;
+        m_tourTitle->setWordWrap(true);
+        QFont titleFont = m_tourTitle->font();
+        titleFont.setBold(true);
+        m_tourTitle->setFont(titleFont);
+        m_tourBody = new QLabel;
+        m_tourBody->setWordWrap(true);
+        layout->addWidget(m_tourTitle);
+        layout->addWidget(m_tourBody);
+        auto *row = new QHBoxLayout;
+        auto *skip = new QPushButton(tr("Пропустить"));
+        m_tourNext = new QPushButton(tr("Дальше"));
+        skip->setCursor(Qt::PointingHandCursor);
+        m_tourNext->setCursor(Qt::PointingHandCursor);
+        row->addWidget(skip);
+        row->addStretch(1);
+        row->addWidget(m_tourNext);
+        layout->addLayout(row);
+        connect(skip, &QPushButton::clicked, this, &MainWindow::finishTour);
+        connect(m_tourNext, &QPushButton::clicked, this, [this]() {
+            ++m_tourStep;
+            showTourStep();
+        });
+    }
+    m_tourStep = 0;
+    QTimer::singleShot(closing ? 320 : 0, this, &MainWindow::showTourStep);
+}
+
+void MainWindow::showTourStep()
+{
+    struct Step {
+        QWidget *target;
+        const char *title;
+        const char *body;
+    };
+    const Step steps[] = {
+        {m_settingsButton, "Настройки",
+         "Логотип открывает настройки: звук, цвет, эквалайзер, оформление окна, папку библиотеки и правку плеера."},
+        {m_addButton, "Библиотека",
+         "«Добавить трек» берёт отдельные файлы. «Импорт папки» следит за папкой и подхватывает новые записи."},
+        {m_searchEdit, "Поиск",
+         "Строка ищет по названию, исполнителю и альбому. Несколько слов должны встретиться все."},
+        {m_playlistView, "Плейлисты",
+         "Список слева. Трек можно перетащить на плейлист. Двойной щелчок по разделителю возвращает ширину колонки."},
+        {m_trackView, "Треки",
+         "Двойной щелчок играет. Повторный щелчок по текущему треку ставит паузу. Правый клик — сведения и обложка."},
+        {m_miniBar, "Плеер и очередь",
+         "Нижняя панель открывает вкладку плеера. Очередь на этой вкладке справа. Пробел — пауза, если курсор не в поле ввода."},
+    };
+    if (m_tourStep < 0 || m_tourStep >= int(std::size(steps)) || !m_tour) {
+        finishTour();
+        return;
+    }
+    const Step &step = steps[m_tourStep];
+    m_tourTitle->setText(QString::fromUtf8(step.title));
+    m_tourBody->setText(QString::fromUtf8(step.body));
+    m_tourNext->setText(m_tourStep + 1 == int(std::size(steps)) ? tr("Понятно") : tr("Дальше"));
+    QWidget *host = centralWidget() ? centralWidget() : static_cast<QWidget *>(this);
+    if (m_tour->parentWidget() != host) m_tour->setParent(host);
+    m_tour->adjustSize();
+    m_tour->show();
+    m_tour->raise();
+    updateTourShade();
+    placeTour();
+}
+
+void MainWindow::placeTour()
+{
+    if (!m_tour || !m_tour->isVisible()) return;
+    QWidget *targets[] = {m_settingsButton, m_addButton, m_searchEdit, m_playlistView, m_trackView, m_miniBar};
+    QWidget *target = m_tourStep >= 0 && m_tourStep < int(std::size(targets)) ? targets[m_tourStep] : nullptr;
+    QWidget *host = m_tour->parentWidget();
+    if (!target || !host) return;
+    const QPoint below = target->mapTo(host, QPoint(target->width() / 2, target->height()));
+    int x = below.x() - m_tour->width() / 2;
+    int y = below.y() + 10;
+    if (y + m_tour->height() > host->height() - 8)
+        y = target->mapTo(host, QPoint(0, 0)).y() - m_tour->height() - 10;
+    x = std::clamp(x, 8, std::max(8, host->width() - m_tour->width() - 8));
+    y = std::clamp(y, 8, std::max(8, host->height() - m_tour->height() - 8));
+    m_tour->move(x, y);
+    updateTourShade();
+    m_tour->raise();
+}
+
+void MainWindow::updateTourShade()
+{
+    QWidget *host = centralWidget();
+    if (!host) return;
+    if (!m_tourShade) m_tourShade = new TourShade(host);
+    if (m_tourShade->parentWidget() != host) m_tourShade->setParent(host);
+    if (!m_tour || !m_tour->isVisible()) {
+        m_tourShade->hide();
+        return;
+    }
+    QWidget *targets[] = {m_settingsButton, m_addButton, m_searchEdit, m_playlistView, m_trackView, m_miniBar};
+    QWidget *target = m_tourStep >= 0 && m_tourStep < int(std::size(targets)) ? targets[m_tourStep] : nullptr;
+    if (!target) {
+        m_tourShade->hide();
+        return;
+    }
+    QRect hole(target->mapTo(host, QPoint(0, 0)), target->size());
+    hole = hole.adjusted(-8, -6, 8, 6).intersected(host->rect());
+    m_tourShade->setHole(host->rect(), hole);
+    m_tourShade->show();
+    m_tourShade->raise();
+    m_tour->raise();
+}
+
+void MainWindow::finishTour()
+{
+    m_db.setSetting(QStringLiteral("tour_done"), QStringLiteral("1"));
+    if (m_tour) m_tour->hide();
+    if (m_tourShade) m_tourShade->hide();
+}
+
+bool MainWindow::chooseLibraryDirectory()
+{
+    const QString current = libraryRootPath();
+    const QString picked = QFileDialog::getExistingDirectory(this, tr("Папка библиотеки"), current);
+    if (picked.isEmpty()) return false;
+    const QString next = QDir(picked).absolutePath();
+    if (QDir(next) == QDir(current)) return false;
+    const QString currentClean = QDir::cleanPath(current);
+    const QString nextClean = QDir::cleanPath(next);
+    if (nextClean.startsWith(currentClean + QLatin1Char('/'), Qt::CaseInsensitive)
+        || currentClean.startsWith(nextClean + QLatin1Char('/'), Qt::CaseInsensitive)) {
+        QMessageBox::warning(this, tr("Папка библиотеки"),
+                             tr("Новая папка не должна лежать внутри текущей, и наоборот."));
+        return false;
+    }
+    if (QFile::exists(QDir(next).filePath(QStringLiteral("library.db")))) {
+        QMessageBox::warning(this, tr("Папка библиотеки"),
+                             tr("В этой папке уже есть библиотека. Выберите пустую."));
+        return false;
+    }
+
+    const QString dbName = QStringLiteral("library.db");
+    const QString newDb = QDir(next).filePath(dbName);
+    QDir().mkpath(next);
+    if (QFile::exists(newDb)) QFile::remove(newDb);
+    m_db.close();
+    const QString newCovers = QDir(next).filePath(QStringLiteral("covers"));
+    const QString newIcons = QDir(next).filePath(QStringLiteral("icons"));
+    if (!QFile::copy(QDir(current).filePath(dbName), newDb)
+        || !copyTree(QDir(current).filePath(QStringLiteral("covers")), newCovers)
+        || !copyTree(QDir(current).filePath(QStringLiteral("icons")), newIcons)
+        || !m_db.reopen(newDb)
+        || !m_db.replaceStoredPathPrefix(current, next)) {
+        QFile::remove(newDb);
+        removeTree(newCovers);
+        removeTree(newIcons);
+        m_db.reopen(QDir(current).filePath(dbName));
+        QMessageBox::warning(this, tr("Папка библиотеки"),
+                             tr("Не удалось перенести библиотеку. Она осталась на прежнем месте."));
+        return false;
+    }
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("library/root"), next);
+    m_covers.setDirectory(QDir(next).filePath(QStringLiteral("covers")));
+    for (const Track &track : m_queue.tracks()) {
+        if (const auto fresh = m_db.trackById(track.id))
+            m_queue.updateCover(track.id, fresh->coverPath);
+    }
+    refreshTracks(m_searchEdit ? m_searchEdit->text() : QString(), true);
+    refreshPlaylists();
+    loadOrCreateDefaultSkin();
+    QFile::remove(QDir(current).filePath(dbName));
+    QFile::remove(QDir(current).filePath(dbName + QStringLiteral("-wal")));
+    QFile::remove(QDir(current).filePath(dbName + QStringLiteral("-shm")));
+    removeTree(QDir(current).filePath(QStringLiteral("covers")));
+    removeTree(QDir(current).filePath(QStringLiteral("icons")));
+    statusBar()->showMessage(tr("Библиотека перенесена"), 4000);
+    return true;
 }
 
 void MainWindow::openPlayerEditor()
@@ -1010,18 +1504,13 @@ void MainWindow::openPlayerEditor()
     auto *miniLayout = qobject_cast<QHBoxLayout *>(m_canvas->parentWidget() ? m_canvas->parentWidget()->layout() : nullptr);
     const int miniIndex = miniLayout ? miniLayout->indexOf(m_canvas) : 0;
 
-    // Measure the canvases where the user actually sees them. A stretched
-    // dialog would turn the same fractions into a different layout.
-    if (!m_panel->isVisible()) {
-        m_panel->setGeometry(playerTarget());
-        if (m_panel->layout()) m_panel->layout()->activate();
-    }
-    QSize tabSize = tab->size();
-    if (tabSize.width() < 80 || tabSize.height() < 80) {
-        const QRect target = playerTarget();
-        const int queue = int(target.width() * m_panel->queueRatio());
-        tabSize = QSize(std::max(240, target.width() - 88 - queue), std::max(240, target.height() - 72));
-    }
+    // The hidden player has not been laid out yet, so its canvas size is the
+    // widget default. Measuring that put the editor controls on top of each other.
+    QSize tabSize;
+    if (m_panel->isVisible() && tab->width() >= 240 && tab->height() >= 240)
+        tabSize = tab->size();
+    else
+        tabSize = m_panel->preferredCanvasSize(playerTarget().size());
     QSize miniSize = m_canvas->size();
     if (miniSize.width() < 80) miniSize.setWidth(std::max(240, width() - 220));
     if (miniSize.height() < 40) miniSize.setHeight(72);
@@ -1035,7 +1524,9 @@ void MainWindow::openPlayerEditor()
     hint->setWordWrap(true);
     hint->setMaximumWidth(std::max(tabSize.width(), miniSize.width()));
     root->addWidget(hint);
+
     root->addWidget(new QLabel(tr("Вкладка")));
+    m_panel->setCanvasEmbedded(false);
     tab->setParent(nullptr);
     tab->setFixedSize(tabSize);
     root->addWidget(tab, 0, Qt::AlignLeft);
@@ -1048,25 +1539,35 @@ void MainWindow::openPlayerEditor()
     root->addWidget(done, 0, Qt::AlignRight);
     dialog.adjustSize();
 
+    const auto putCanvasesBack = [&]() {
+        tab->setParent(nullptr);
+        m_canvas->setParent(nullptr);
+        tab->setMinimumSize(0, 0);
+        tab->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        tab->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        m_canvas->setMinimumSize(0, 0);
+        m_canvas->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        m_canvas->setFixedHeight(72);
+        m_canvas->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        if (split) {
+            split->insertWidget(splitIndex, tab);
+            split->setStretchFactor(splitIndex, 1);
+        }
+        if (miniLayout) miniLayout->insertWidget(miniIndex, m_canvas, 1);
+        m_panel->setCanvasEmbedded(true);
+        m_panel->setEditMode(false);
+        m_canvas->setEditMode(false);
+    };
+    struct Restore {
+        std::function<void()> fn;
+        ~Restore() { if (fn) fn(); }
+    } restore{putCanvasesBack};
+
     m_panel->setEditMode(true);
     m_canvas->setEditMode(true);
     dialog.exec();
-
-    tab->setMinimumSize(0, 0);
-    tab->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
-    tab->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_canvas->setMinimumSize(0, 0);
-    m_canvas->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
-    m_canvas->setFixedHeight(72);
-    m_canvas->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-
-    if (split) {
-        split->insertWidget(splitIndex, tab);
-        split->setStretchFactor(splitIndex, 1);
-    }
-    if (miniLayout) miniLayout->insertWidget(miniIndex, m_canvas, 1);
-    m_panel->setEditMode(false);
-    m_canvas->setEditMode(false);
+    restore.fn();
+    restore.fn = nullptr;
     onSkinLayoutChanged();
 }
 
@@ -1134,7 +1635,7 @@ void MainWindow::configureItem(DraggableItem *item)
         if (picked.isEmpty()) return;
         QImage image;
         if (!loadStaticPng(this, picked, &image)) return;
-        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/icons");
+        const QString dir = libraryRootPath() + QStringLiteral("/icons");
         QDir().mkpath(dir);
         const QString dest = dir + QLatin1Char('/') + item->elementId() + QStringLiteral(".png");
         image.save(dest, "PNG");
@@ -1156,7 +1657,7 @@ void MainWindow::configureItem(DraggableItem *item)
         if (picked.isEmpty()) return;
         QImage image;
         if (!loadStaticPng(this, picked, &image)) return;
-        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/icons");
+        const QString dir = libraryRootPath() + QStringLiteral("/icons");
         QDir().mkpath(dir);
         const QString dest = dir + QLatin1Char('/') + item->elementId() + QStringLiteral("_frame.png");
         image.save(dest, "PNG");
@@ -1213,7 +1714,7 @@ void MainWindow::configureCanvas(SkinCanvas *canvas)
         if (picked.isEmpty()) return;
         QImage image;
         if (!loadStaticPng(this, picked, &image)) return;
-        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/icons");
+        const QString dir = libraryRootPath() + QStringLiteral("/icons");
         QDir().mkpath(dir);
         const QString dest = dir + QLatin1Char('/')
             + (canvas == m_canvas ? QStringLiteral("mini_background.png") : QStringLiteral("player_background.png"));

@@ -1,4 +1,5 @@
 #include "Database.h"
+#include <QDir>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QVariant>
@@ -137,6 +138,90 @@ Database::Database(const QString &dbFilePath)
 }
 
 Database::~Database() = default;
+
+void Database::close()
+{
+    m_search.reset();
+    m_searchDirty = true;
+    if (QSqlDatabase::contains(m_connectionName)) {
+        {
+            QSqlDatabase database = QSqlDatabase::database(m_connectionName);
+            if (database.isValid() && database.isOpen()) {
+                QSqlQuery checkpoint(database);
+                checkpoint.exec(QStringLiteral("PRAGMA wal_checkpoint(TRUNCATE)"));
+                database.close();
+            }
+        }
+        QSqlDatabase::removeDatabase(m_connectionName);
+    }
+}
+
+bool Database::reopen(const QString &dbFilePath)
+{
+    close();
+    m_path = dbFilePath;
+    return init();
+}
+
+bool Database::replaceStoredPathPrefix(const QString &oldPrefix, const QString &newPrefix)
+{
+    const QString oldClean = QDir::cleanPath(oldPrefix);
+    const QString newClean = QDir::cleanPath(newPrefix);
+    if (oldClean.compare(newClean, Qt::CaseInsensitive) == 0) return true;
+    const QString oldNative = QDir::toNativeSeparators(oldClean);
+    const QString newNative = QDir::toNativeSeparators(newClean);
+
+    QSqlDatabase database = db();
+    if (!database.isOpen() || !database.transaction()) return false;
+
+    const auto rewriteColumn = [&](const QString &table, const QString &idColumn, const QString &pathColumn) {
+        QSqlQuery read(database);
+        if (!read.exec(QStringLiteral("SELECT %1, %2 FROM %3").arg(idColumn, pathColumn, table)))
+            return false;
+        QSqlQuery write(database);
+        write.prepare(QStringLiteral("UPDATE %1 SET %2 = ? WHERE %3 = ?").arg(table, pathColumn, idColumn));
+        while (read.next()) {
+            const QString path = read.value(1).toString();
+            if (path.isEmpty()) continue;
+            const QString clean = QDir::cleanPath(path);
+            if (!clean.startsWith(oldClean, Qt::CaseInsensitive)) continue;
+            if (clean.size() > oldClean.size() && clean.at(oldClean.size()) != QLatin1Char('/')) continue;
+            const QString updated = QDir::toNativeSeparators(newClean + clean.mid(oldClean.size()));
+            write.bindValue(0, updated);
+            write.bindValue(1, read.value(0));
+            if (!write.exec()) return false;
+        }
+        return true;
+    };
+
+    bool ok = rewriteColumn(QStringLiteral("tracks"), QStringLiteral("id"), QStringLiteral("cover_path"));
+    ok = ok && rewriteColumn(QStringLiteral("playlists"), QStringLiteral("id"), QStringLiteral("cover_path"));
+    if (ok) {
+        QSqlQuery read(database);
+        ok = read.exec(QStringLiteral("SELECT name, layout_json FROM skins"));
+        QSqlQuery write(database);
+        write.prepare(QStringLiteral("UPDATE skins SET layout_json = ? WHERE name = ?"));
+        while (ok && read.next()) {
+            QString json = read.value(1).toString();
+            const QString original = json;
+            json.replace(oldClean + QStringLiteral("/"), newClean + QStringLiteral("/"), Qt::CaseInsensitive);
+            json.replace(oldNative + QStringLiteral("\\"), newNative + QStringLiteral("\\"), Qt::CaseInsensitive);
+            json.replace(oldNative + QStringLiteral("/"), newNative + QStringLiteral("/"), Qt::CaseInsensitive);
+            if (json == original) continue;
+            write.bindValue(0, json);
+            write.bindValue(1, read.value(0));
+            ok = write.exec();
+        }
+    }
+
+    if (!ok || !database.commit()) {
+        database.rollback();
+        return false;
+    }
+    m_search.reset();
+    m_searchDirty = true;
+    return true;
+}
 
 QSqlDatabase Database::db() const
 {

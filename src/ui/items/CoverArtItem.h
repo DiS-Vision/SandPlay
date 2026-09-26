@@ -46,7 +46,8 @@ private:
     Shape m_shape = Shape::Rounded;
     bool m_playing = false;
     qreal m_angle = 0;
-    class QVariantAnimation *m_spin = nullptr;
+    qint64 m_spinEpoch = 0;
+    class QTimer *m_spinTimer = nullptr;
     mutable QPixmap m_artCache;
     mutable qint64 m_artCacheKey = 0;
 };

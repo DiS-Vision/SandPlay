@@ -9,11 +9,13 @@
 #include <QPushButton>
 #include <QColor>
 #include <QSplitter>
+#include <QFrame>
 
 class QResizeEvent;
 class QCloseEvent;
 class QKeyEvent;
 class QPropertyAnimation;
+class TourShade;
 class SkinCanvas;
 class DraggableItem;
 
@@ -98,6 +100,18 @@ private:
     CoverArtItem *m_coverItem = nullptr;
     TrackLabelItem *m_labelItem = nullptr;
     PlayerPanel *m_panel = nullptr;
+    QWidget *m_addButton = nullptr;
+    QWidget *m_settingsButton = nullptr;
+    QWidget *m_miniBar = nullptr;
+    QFrame *m_tour = nullptr;
+    TourShade *m_tourShade = nullptr;
+    QLabel *m_tourTitle = nullptr;
+    QLabel *m_tourBody = nullptr;
+    QPushButton *m_tourNext = nullptr;
+    int m_tourStep = 0;
+    QString m_uiFontFamily;
+    int m_uiFontSize = 10;
+    int m_buttonStyle = 0;
 
     void refreshTracks(const QString &search = {}, bool keepScroll = false);
     void presentTracks(const QVector<Track> &tracks, int libraryTotal, bool keepScroll);
@@ -112,8 +126,17 @@ private:
     void setPlayerOpen(bool open);
     QRect playerTarget() const;
     void applyAccent(const QColor &color);
-    void openLogoMenu();
+    void applyWindowChrome();
+    void openSettings();
+    void startTour();
+    void showTourStep();
+    void placeTour();
+    void updateTourShade();
+    void finishTour();
+    bool chooseLibraryDirectory();
     void openPlayerEditor();
+    void openWindowEditor();
+    bool adoptFontFile(const QString &path);
     void configureItem(DraggableItem *item);
     void configureCanvas(SkinCanvas *canvas);
     void mirrorTabLook();

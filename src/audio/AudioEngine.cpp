@@ -27,17 +27,45 @@ BiquadCoeff peaking(double sampleRate, double frequency, double q, double db)
         float(1.0 + alpha / A), float(-2.0 * cosw), float(1.0 - alpha / A)};
 }
 
+int nativeSampleRate()
+{
+    ma_device_config config = ma_device_config_init(ma_device_type_playback);
+    config.playback.format = ma_format_f32;
+    config.playback.channels = 2;
+    ma_device probe{};
+    if (ma_device_init(nullptr, &config, &probe) != MA_SUCCESS) return 48000;
+    const int rate = int(probe.sampleRate);
+    ma_device_uninit(&probe);
+    return rate > 0 ? rate : 48000;
+}
+
+ma_format formatForDepth(int bitDepth)
+{
+    switch (bitDepth) {
+    case 16: return ma_format_s16;
+    case 24: return ma_format_s24;
+    case 32: return ma_format_s32;
+    default: return ma_format_f32;
+    }
+}
+
 } // namespace
 
 struct AudioEngine::Impl {
     ma_engine engine{};
     ma_sound sound{};
+    ma_device device{};
     ma_biquad_node bands[kBands]{};
     float gains[kBands]{};
+    float scratch[2048 * 2]{};
     ma_uint32 channels = 2;
+    ma_format playbackFormat = ma_format_f32;
     bool engineReady = false;
     bool soundLoaded = false;
     bool bandsReady = false;
+    bool deviceReady = false;
+
+    static void playbackData(ma_device *device, void *output, const void *input, ma_uint32 frameCount);
 
     void retune(int band)
     {
@@ -49,6 +77,29 @@ struct AudioEngine::Impl {
     }
 };
 
+void AudioEngine::Impl::playbackData(ma_device *device, void *output, const void *, ma_uint32 frameCount)
+{
+    auto *impl = static_cast<AudioEngine::Impl *>(device->pUserData);
+    if (!impl || !impl->engineReady || !output) return;
+    const ma_uint32 channels = std::max(1u, impl->channels);
+    if (impl->playbackFormat == ma_format_f32) {
+        ma_engine_read_pcm_frames(&impl->engine, output, frameCount, nullptr);
+        return;
+    }
+    constexpr ma_uint32 kChunk = 2048;
+    auto *dst = static_cast<unsigned char *>(output);
+    const ma_uint32 bytesPerFrame = ma_get_bytes_per_frame(impl->playbackFormat, channels);
+    ma_uint32 remaining = frameCount;
+    while (remaining > 0) {
+        const ma_uint32 count = std::min(remaining, kChunk);
+        ma_engine_read_pcm_frames(&impl->engine, impl->scratch, count, nullptr);
+        ma_convert_pcm_frames_format(dst, impl->playbackFormat, impl->scratch, ma_format_f32,
+                                     count, channels, ma_dither_mode_triangle);
+        dst += count * bytesPerFrame;
+        remaining -= count;
+    }
+}
+
 AudioEngine::AudioEngine(QObject *parent)
     : QObject(parent), m_impl(std::make_unique<Impl>())
 {
@@ -58,24 +109,119 @@ AudioEngine::AudioEngine(QObject *parent)
 
 AudioEngine::~AudioEngine()
 {
-    if (m_impl->soundLoaded) ma_sound_uninit(&m_impl->sound);
+    shutdown();
+}
+
+void AudioEngine::setOutputPreference(int sampleRate, int bitDepth)
+{
+    m_sampleRate = sampleRate;
+    m_bitDepth = bitDepth;
+}
+
+void AudioEngine::shutdown()
+{
+    m_pollTimer.stop();
+    if (m_impl->deviceReady)
+        ma_device_stop(&m_impl->device);
+    if (m_impl->soundLoaded) {
+        ma_sound_uninit(&m_impl->sound);
+        m_impl->soundLoaded = false;
+    }
     if (m_impl->bandsReady) {
         for (int i = 0; i < kBands; ++i)
             ma_biquad_node_uninit(&m_impl->bands[i], nullptr);
+        m_impl->bandsReady = false;
     }
-    if (m_impl->engineReady) ma_engine_uninit(&m_impl->engine);
+    if (m_impl->engineReady) {
+        ma_engine_uninit(&m_impl->engine);
+        m_impl->engineReady = false;
+    }
+    if (m_impl->deviceReady) {
+        ma_device_uninit(&m_impl->device);
+        m_impl->deviceReady = false;
+    }
 }
 
 bool AudioEngine::init()
 {
-    ma_result result = ma_engine_init(nullptr, &m_impl->engine);
+    shutdown();
+    const bool custom = m_sampleRate != 0 || m_bitDepth != 0;
+    const bool ok = custom ? initCustom() : initNative();
+    if (!ok) {
+        shutdown();
+        return false;
+    }
+    if (m_impl->engineReady)
+        ma_engine_set_volume(&m_impl->engine, m_volume);
+    return true;
+}
+
+bool AudioEngine::configureOutput(int sampleRate, int bitDepth)
+{
+    const QString path = m_loadedPath;
+    const qint64 position = positionMs();
+    const bool playing = isPlaying();
+    const int previousRate = m_sampleRate;
+    const int previousDepth = m_bitDepth;
+    m_sampleRate = sampleRate;
+    m_bitDepth = bitDepth;
+    if (!init()) {
+        m_sampleRate = previousRate;
+        m_bitDepth = previousDepth;
+        init();
+        restorePlayback(path, position, playing);
+        return false;
+    }
+    restorePlayback(path, position, playing);
+    return true;
+}
+
+bool AudioEngine::initNative()
+{
+    const ma_result result = ma_engine_init(nullptr, &m_impl->engine);
     if (result != MA_SUCCESS) {
         emit errorOccurred(QStringLiteral("audio device init failed (%1)").arg(int(result)));
         return false;
     }
     m_impl->engineReady = true;
-    ma_engine_set_volume(&m_impl->engine, m_volume);
+    m_impl->playbackFormat = ma_format_f32;
+    return attachEqualizer();
+}
 
+bool AudioEngine::initCustom()
+{
+    const int rate = m_sampleRate > 0 ? m_sampleRate : nativeSampleRate();
+    const ma_format format = formatForDepth(m_bitDepth);
+
+    ma_engine_config engineConfig = ma_engine_config_init();
+    engineConfig.noDevice = MA_TRUE;
+    engineConfig.channels = 2;
+    engineConfig.sampleRate = ma_uint32(rate);
+    if (ma_engine_init(&engineConfig, &m_impl->engine) != MA_SUCCESS)
+        return false;
+    m_impl->engineReady = true;
+    m_impl->channels = 2;
+    m_impl->playbackFormat = format;
+    if (!attachEqualizer())
+        return false;
+
+    ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+    deviceConfig.playback.format = format;
+    deviceConfig.playback.channels = 2;
+    deviceConfig.sampleRate = ma_uint32(rate);
+    deviceConfig.dataCallback = Impl::playbackData;
+    deviceConfig.pUserData = m_impl.get();
+    deviceConfig.noPreSilencedOutputBuffer = MA_TRUE;
+    if (ma_device_init(nullptr, &deviceConfig, &m_impl->device) != MA_SUCCESS)
+        return false;
+    m_impl->deviceReady = true;
+    if (ma_device_start(&m_impl->device) != MA_SUCCESS)
+        return false;
+    return true;
+}
+
+bool AudioEngine::attachEqualizer()
+{
     m_impl->channels = std::max(1u, ma_engine_get_channels(&m_impl->engine));
     ma_node_graph *graph = ma_engine_get_node_graph(&m_impl->engine);
     int made = 0;
@@ -88,16 +234,24 @@ bool AudioEngine::init()
                 break;
         }
     }
-    if (made == kBands) {
-        for (int i = 0; i < kBands - 1; ++i)
-            ma_node_attach_output_bus(&m_impl->bands[i], 0, &m_impl->bands[i + 1], 0);
-        ma_node_attach_output_bus(&m_impl->bands[kBands - 1], 0, ma_engine_get_endpoint(&m_impl->engine), 0);
-        m_impl->bandsReady = true;
-    } else {
+    if (made != kBands) {
         for (int i = 0; i < made; ++i)
             ma_biquad_node_uninit(&m_impl->bands[i], nullptr);
+        return true;
     }
+    for (int i = 0; i < kBands - 1; ++i)
+        ma_node_attach_output_bus(&m_impl->bands[i], 0, &m_impl->bands[i + 1], 0);
+    ma_node_attach_output_bus(&m_impl->bands[kBands - 1], 0, ma_engine_get_endpoint(&m_impl->engine), 0);
+    m_impl->bandsReady = true;
     return true;
+}
+
+void AudioEngine::restorePlayback(const QString &path, qint64 position, bool playing)
+{
+    if (path.isEmpty() || !m_impl->engineReady) return;
+    if (!loadAndPlay(path)) return;
+    if (position > 0) seekToMs(position);
+    if (!playing) pause();
 }
 
 bool AudioEngine::loadAndPlay(const QString &path)
@@ -107,6 +261,7 @@ bool AudioEngine::loadAndPlay(const QString &path)
     if (m_impl->soundLoaded) {
         ma_sound_uninit(&m_impl->sound);
         m_impl->soundLoaded = false;
+        m_loadedPath.clear();
     }
 
     const QByteArray pathUtf8 = path.toUtf8();
@@ -121,6 +276,7 @@ bool AudioEngine::loadAndPlay(const QString &path)
         return false;
     }
     m_impl->soundLoaded = true;
+    m_loadedPath = path;
     if (m_impl->bandsReady)
         ma_node_attach_output_bus(reinterpret_cast<ma_node *>(&m_impl->sound), 0, &m_impl->bands[0], 0);
     m_wasAtEnd = false;
@@ -153,6 +309,7 @@ void AudioEngine::stop()
     ma_sound_stop(&m_impl->sound);
     ma_sound_uninit(&m_impl->sound);
     m_impl->soundLoaded = false;
+    m_loadedPath.clear();
     m_pollTimer.stop();
     emit playbackStateChanged(false);
 }

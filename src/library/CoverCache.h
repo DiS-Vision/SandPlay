@@ -12,6 +12,8 @@
 class CoverCache {
 public:
     explicit CoverCache(const QString &cacheDir);
+    void setDirectory(const QString &cacheDir);
+    QString directory() const { return m_dir; }
 
     QString pathForTrack(qint64 trackId) const;
     QString pathForPlaylist(qint64 playlistId) const;

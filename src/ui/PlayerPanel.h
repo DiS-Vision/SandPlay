@@ -22,14 +22,14 @@ class QSplitter;
 class QListView;
 
 // Full-window player. The left side is a skin canvas (buttons keep the
-// positions and colors the user chose). The queue sits on the right and
-// can be widened only up to the middle of the tab.
+// positions and colors the user chose). The queue stays on the right.
 class PlayerPanel : public QWidget {
     Q_OBJECT
 public:
     explicit PlayerPanel(QWidget *parent = nullptr);
 
     SkinCanvas *canvas() const { return m_canvas; }
+    QListView *queueView() const { return m_queueView; }
 
     void setTrack(const std::optional<Track> &track);
     void setCover(const QPixmap &pixmap);
@@ -43,6 +43,11 @@ public:
     void setCoverStatus(const QString &text);
     void setQueueRatio(qreal ratio);
     qreal queueRatio() const { return m_queueRatio; }
+    // Canvas size inside a player panel of the given size. Used when the
+    // panel is still hidden and has not been laid out yet.
+    QSize preferredCanvasSize(const QSize &panelSize) const;
+    // The editor pulls the canvas out of the splitter and puts it back.
+    void setCanvasEmbedded(bool embedded);
     void setEditMode(bool on);
     bool editMode() const;
     void setCoverShapeId(const QString &id);
@@ -71,10 +76,12 @@ signals:
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
 
 private:
     void applyQueueChrome();
     void applyQueueRatio();
+    void syncBackdrop();
     static QString formatTime(qint64 ms);
 
     QWidget *m_queuePane = nullptr;

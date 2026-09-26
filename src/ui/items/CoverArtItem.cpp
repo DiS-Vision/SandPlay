@@ -1,21 +1,21 @@
 #include "CoverArtItem.h"
-#include <QEasingCurve>
+#include <QDateTime>
 #include <QImage>
 #include <QPainter>
 #include <QPainterPath>
 #include <QRadialGradient>
-#include <QVariantAnimation>
+#include <QTimer>
 #include <algorithm>
 #include <cmath>
 
 CoverArtItem::CoverArtItem(QGraphicsItem *parent) : DraggableItem("cover_art", parent)
 {
-    m_spin = new QVariantAnimation(this);
-    m_spin->setDuration(6000);
-    m_spin->setLoopCount(-1);
-    m_spin->setEasingCurve(QEasingCurve::Linear);
-    connect(m_spin, &QVariantAnimation::valueChanged, this, [this](const QVariant &value) {
-        m_angle = std::fmod(value.toReal(), 360.0);
+    m_spinTimer = new QTimer(this);
+    m_spinTimer->setTimerType(Qt::PreciseTimer);
+    m_spinTimer->setInterval(16);
+    connect(m_spinTimer, &QTimer::timeout, this, [this]() {
+        const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_spinEpoch;
+        m_angle = std::fmod(double(elapsed) / 6000.0 * 360.0, 360.0);
         if (m_angle < 0) m_angle += 360.0;
         update();
     });
@@ -66,7 +66,11 @@ void CoverArtItem::paint(QPainter *painter, const QStyleOptionGraphicsItem *, QW
         painter->translate(center);
         painter->rotate(m_angle);
         painter->translate(-center);
-        drawArt(painter, disc);
+        // A square the size of the disc leaves gaps once it turns. The art has
+        // to cover the circle at every angle, then the turn repeats from 0.
+        const qreal cover = disc.width() * std::sqrt(2.0);
+        const QRectF art(center.x() - cover / 2.0, center.y() - cover / 2.0, cover, cover);
+        drawArt(painter, art);
         painter->restore();
 
         const qreal ring = std::max(1.6, disc.width() * 0.034);
@@ -132,18 +136,16 @@ void CoverArtItem::syncSpin()
 {
     const bool spin = m_playing && m_shape == Shape::Vinyl && !isEditable();
     if (!spin) {
-        if (m_spin->state() == QAbstractAnimation::Running)
-            m_spin->stop();
+        m_spinTimer->stop();
         if (m_shape != Shape::Vinyl && m_angle != 0) {
             m_angle = 0;
             update();
         }
         return;
     }
-    if (m_spin->state() == QAbstractAnimation::Running) return;
-    m_spin->setStartValue(m_angle);
-    m_spin->setEndValue(m_angle + 360.0);
-    m_spin->start();
+    if (m_spinTimer->isActive()) return;
+    m_spinEpoch = QDateTime::currentMSecsSinceEpoch() - qint64(std::llround(m_angle / 360.0 * 6000.0));
+    m_spinTimer->start();
 }
 
 void CoverArtItem::setSize(qreal size)

@@ -17,6 +17,8 @@
 #include <QMouseEvent>
 #include <QIcon>
 #include <QFont>
+#include <QFrame>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
 #include <QResizeEvent>
@@ -216,13 +218,22 @@ public:
         }
         const bool fading = dragRow == index.row();
         const bool selected = opt.state.testFlag(QStyle::State_Selected);
-        QColor background(QStringLiteral("#181b22"));
-        if (const QVariant fill = index.data(Qt::BackgroundRole); fill.canConvert<QColor>())
-            background = fill.value<QColor>();
-        if (selected) background = QColor(QStringLiteral("#3a3428"));
+        const bool current = index.data(Qt::BackgroundRole).canConvert<QColor>();
         painter->save();
         if (fading) painter->setOpacity(0.45);
-        painter->fillRect(opt.rect, background);
+        if (selected || current) {
+            QColor background = opt.palette.color(QPalette::Highlight);
+            if (!background.isValid()) background = QColor(QStringLiteral("#3a3428"));
+            QRect highlight = opt.rect;
+            if (const auto *view = qobject_cast<const QAbstractItemView *>(opt.widget)) {
+                highlight.setLeft(0);
+                highlight.setWidth(view->viewport()->width());
+            }
+            painter->save();
+            painter->setClipping(false);
+            painter->fillRect(highlight, background);
+            painter->restore();
+        }
 
         QRect textRect = opt.rect.adjusted(8, 0, -kQueueGrip, 0);
         if (!opt.icon.isNull()) {
@@ -263,6 +274,7 @@ public:
         if (!view) return size;
         const int width = view->viewport()->width();
         if (width > 0) size.setWidth(width);
+        size.setHeight(size.height() + 6);
         return size;
     }
 };
@@ -309,6 +321,7 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
 
     m_canvas = new SkinCanvas;
     m_canvas->setSurfaceColor(QColor(QStringLiteral("#181b22")));
+    connect(m_canvas, &SkinCanvas::backgroundChanged, this, [this]() { syncBackdrop(); });
 
     m_cover = new CoverArtItem;
     m_label = new TrackLabelItem;
@@ -338,7 +351,7 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     m_queueView = queueView;
     m_queueView->setModel(&m_queueModel);
     m_queueView->setIconSize(QSize(36, 36));
-    m_queueView->setSpacing(4);
+    m_queueView->setSpacing(0);
     m_queueView->setWordWrap(false);
     m_queueView->setTextElideMode(Qt::ElideRight);
     m_queueView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -355,23 +368,33 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     m_queueView->setPalette(queuePalette);
     m_queueView->viewport()->setPalette(queuePalette);
     m_queueView->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_queueView->setFrameShape(QFrame::NoFrame);
+    m_queueView->viewport()->setAutoFillBackground(false);
     m_queueEmpty = new QLabel(tr("Очередь пуста. Дважды щёлкните трек в библиотеке или перетащите его сюда."));
     m_queueEmpty->setWordWrap(true);
     m_queueEmpty->setStyleSheet(QStringLiteral("color: #8b8a86; background: transparent;"));
 
-    auto *queueLayout = new QVBoxLayout;
-    queueLayout->setContentsMargins(8, 0, 16, 16);
+    auto *queueCard = new QFrame;
+    queueCard->setObjectName(QStringLiteral("queueCard"));
+    queueCard->setAttribute(Qt::WA_StyledBackground, true);
+    auto *queueLayout = new QVBoxLayout(queueCard);
+    queueLayout->setContentsMargins(12, 12, 12, 12);
+    queueLayout->setSpacing(8);
     queueLayout->addWidget(m_queueTitle);
     queueLayout->addWidget(m_queueView, 1);
     queueLayout->addWidget(m_queueEmpty);
     m_queueView->hide();
     m_queuePane = new QWidget;
     m_queuePane->setObjectName(QStringLiteral("playerQueue"));
-    m_queuePane->setAttribute(Qt::WA_StyledBackground, true);
-    m_queuePane->setLayout(queueLayout);
+    auto *paneLayout = new QVBoxLayout(m_queuePane);
+    paneLayout->setContentsMargins(8, 12, 14, 16);
+    paneLayout->addWidget(queueCard);
     m_queuePane->setMinimumWidth(180);
 
     m_split = new QSplitter;
+    m_split->setObjectName(QStringLiteral("playerSplit"));
+    m_split->setAttribute(Qt::WA_StyledBackground, true);
+    m_split->setAutoFillBackground(false);
     m_split->addWidget(m_canvas);
     m_split->addWidget(m_queuePane);
     m_split->setStretchFactor(0, 1);
@@ -439,21 +462,63 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
 void PlayerPanel::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    const int half = std::max(160, width() / 2);
-    m_queuePane->setMaximumWidth(half);
-    m_queuePane->setMinimumWidth(std::min(180, half));
     applyQueueRatio();
     applyQueueChrome();
 }
 
+void PlayerPanel::paintEvent(QPaintEvent *event)
+{
+    QWidget::paintEvent(event);
+    if (!m_canvas || !m_split || m_canvas->parentWidget() != m_split || !m_canvas->hasBackground()) return;
+    const QPixmap &image = m_canvas->backgroundPixmap();
+    if (image.isNull()) return;
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    painter.drawPixmap(m_split->geometry(), image);
+}
+
+void PlayerPanel::setCanvasEmbedded(bool embedded)
+{
+    if (!embedded) {
+        if (m_canvas) m_canvas->setClearBackdrop(false);
+        return;
+    }
+    syncBackdrop();
+}
+
+void PlayerPanel::syncBackdrop()
+{
+    if (!m_canvas) return;
+    const bool shared = m_canvas->hasBackground() && m_canvas->parentWidget() == m_split;
+    m_canvas->setClearBackdrop(shared);
+    if (QWidget *card = findChild<QWidget *>(QStringLiteral("queueCard"))) {
+        card->setProperty("photo", shared);
+        card->style()->unpolish(card);
+        card->style()->polish(card);
+        card->update();
+    }
+    update();
+}
+
 void PlayerPanel::applyQueueRatio()
 {
-    const int total = m_split->width();
+    m_split->setOrientation(Qt::Horizontal);
+    if (m_split->widget(0) != m_canvas)
+        m_split->insertWidget(0, m_canvas);
+    if (auto *layout = qobject_cast<QVBoxLayout *>(m_queuePane->layout()))
+        layout->setContentsMargins(8, 12, 14, 16);
+
+    m_queuePane->setMaximumHeight(QWIDGETSIZE_MAX);
+    m_queuePane->setMinimumHeight(0);
     const int panelWidth = std::max(width(), 1);
+    const int maxQueue = std::max(260, panelWidth / 2);
+    m_queuePane->setMaximumWidth(maxQueue);
+    m_queuePane->setMinimumWidth(std::min(260, maxQueue));
+    const int total = m_split->width();
     if (total < 80) return;
-    const int maxQueue = std::min(m_queuePane->maximumWidth(), std::max(160, panelWidth / 2));
-    const int minQueue = m_queuePane->minimumWidth();
-    const int queue = std::clamp(int(std::lround(panelWidth * m_queueRatio)), minQueue, std::max(minQueue, maxQueue));
+    const int queue = std::clamp(int(std::lround(panelWidth * m_queueRatio)),
+                                  m_queuePane->minimumWidth(),
+                                  std::max(m_queuePane->minimumWidth(), maxQueue));
     m_applyingRatio = true;
     m_split->setSizes({std::max(0, total - queue), queue});
     m_applyingRatio = false;
@@ -599,8 +664,18 @@ bool PlayerPanel::hasCoverFrame() const
 
 void PlayerPanel::setQueueRatio(qreal ratio)
 {
-    m_queueRatio = std::clamp(ratio, 0.16, 0.5);
+    m_queueRatio = std::clamp(ratio, 0.28, 0.5);
     applyQueueRatio();
+}
+
+QSize PlayerPanel::preferredCanvasSize(const QSize &panelSize) const
+{
+    const int splitW = std::max(0, panelSize.width() - 88);
+    const int splitH = std::max(0, panelSize.height() - 72);
+    const int maxQueue = std::max(260, panelSize.width() / 2);
+    const int minQueue = std::min(260, std::max(0, maxQueue));
+    const int queue = std::clamp(int(std::lround(panelSize.width() * m_queueRatio)), minQueue, std::max(minQueue, maxQueue));
+    return QSize(std::max(240, splitW - queue), std::max(240, splitH));
 }
 
 QList<qint64> PlayerPanel::takePendingDropIds()

@@ -20,7 +20,14 @@ public:
     explicit AudioEngine(QObject *parent = nullptr);
     ~AudioEngine() override;
 
-    bool init();                         // sets up the ma_engine + output device once
+    // 0 sample rate keeps the device's native rate. 0 bit depth is 32-bit float.
+    // Any other pair opens the device at that rate and 16/24/32-bit integer.
+    void setOutputPreference(int sampleRate, int bitDepth);
+    bool init();
+    // Rebuilds the device. A track that is loaded keeps its place.
+    bool configureOutput(int sampleRate, int bitDepth);
+    int sampleRate() const { return m_sampleRate; }
+    int bitDepth() const { return m_bitDepth; }
     bool loadAndPlay(const QString &path);
     void pause();
     void resume();
@@ -50,9 +57,18 @@ private slots:
     void pollProgress();                 // QTimer tick: checks position + end-of-stream
 
 private:
+    void shutdown();
+    bool initNative();
+    bool initCustom();
+    bool attachEqualizer();
+    void restorePlayback(const QString &path, qint64 positionMs, bool playing);
+
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     QTimer m_pollTimer;
     bool m_wasAtEnd = false;
     float m_volume = 0.8f;
+    int m_sampleRate = 0;
+    int m_bitDepth = 0;
+    QString m_loadedPath;
 };

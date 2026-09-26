@@ -35,7 +35,10 @@ public:
     void setBackgroundPath(const QString &path);
     void clearBackground();
     bool hasBackground() const { return !m_background.isNull(); }
+    const QPixmap &backgroundPixmap() const { return m_background; }
     QString backgroundPath() const { return m_backgroundPath; }
+    // The player paints one image across the canvas and the queue.
+    void setClearBackdrop(bool on);
     QVector<DraggableItem *> items() const;
     QMap<QString, QPointF> positions() const;
     bool samePositions(const QMap<QString, QPointF> &saved) const;
@@ -50,6 +53,7 @@ public:
 
 signals:
     void layoutChanged(); // an item was dropped in a new spot — caller may want to auto-save/debounce
+    void backgroundChanged();
     void backgroundClicked(); // click on empty canvas, outside edit mode
     void itemMenuRequested(DraggableItem *item);
     void canvasMenuRequested();
@@ -74,6 +78,8 @@ private:
     qreal m_userScale = 1.0;
     QPixmap m_background;
     QString m_backgroundPath;
+    QColor m_surface{"#1b1e27"};
+    bool m_clearBackdrop = false;
 
     void showGuides(bool showH, qreal y, bool showV, qreal x);
     void rememberFraction(DraggableItem *item);

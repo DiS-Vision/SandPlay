@@ -74,6 +74,7 @@ qt_add_executable(music_player WIN32
   src/ui/CoverThumb.cpp
   src/ui/MainWindow.cpp
   src/ui/PlayerPanel.cpp
+  src/ui/SettingsDialog.cpp
   src/ui/SkinCanvas.cpp
   src/ui/DraggableItem.cpp
   src/ui/items/PlayPauseButtonItem.cpp

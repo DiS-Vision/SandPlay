@@ -9,6 +9,12 @@ CoverCache::CoverCache(const QString &cacheDir) : m_dir(cacheDir)
     QDir().mkpath(m_dir);
 }
 
+void CoverCache::setDirectory(const QString &cacheDir)
+{
+    m_dir = cacheDir;
+    QDir().mkpath(m_dir);
+}
+
 QString CoverCache::pathForTrack(qint64 trackId) const
 {
     return QDir(m_dir).filePath(QStringLiteral("track_%1.jpg").arg(trackId));

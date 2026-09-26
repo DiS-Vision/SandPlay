@@ -57,8 +57,31 @@ void SkinCanvas::registerFractionalItem(DraggableItem *item, const QPointF &frac
 
 void SkinCanvas::setSurfaceColor(const QColor &color)
 {
+    m_surface = color;
+    if (m_clearBackdrop) return;
     setBackgroundBrush(color);
     m_scene.setBackgroundBrush(color);
+}
+
+void SkinCanvas::setClearBackdrop(bool on)
+{
+    if (m_clearBackdrop == on) return;
+    m_clearBackdrop = on;
+    const QColor fill = on ? Qt::transparent : m_surface;
+    setBackgroundBrush(fill);
+    m_scene.setBackgroundBrush(fill);
+    setStyleSheet(on ? QStringLiteral("background: transparent; border: none;") : QString());
+    viewport()->setStyleSheet(on ? QStringLiteral("background: transparent;") : QString());
+    viewport()->setAutoFillBackground(!on);
+    viewport()->setAttribute(Qt::WA_TranslucentBackground, on);
+    setAttribute(Qt::WA_TranslucentBackground, on);
+    if (on) {
+        QPalette palette = viewport()->palette();
+        palette.setColor(QPalette::Base, Qt::transparent);
+        palette.setColor(QPalette::Window, Qt::transparent);
+        viewport()->setPalette(palette);
+    }
+    viewport()->update();
 }
 
 void SkinCanvas::setBackgroundPath(const QString &path)
@@ -66,6 +89,7 @@ void SkinCanvas::setBackgroundPath(const QString &path)
     m_backgroundPath = path;
     m_background = path.isEmpty() ? QPixmap() : QPixmap(path);
     viewport()->update();
+    emit backgroundChanged();
 }
 
 void SkinCanvas::clearBackground()
@@ -283,6 +307,7 @@ void SkinCanvas::contextMenuEvent(QContextMenuEvent *event)
 
 void SkinCanvas::drawBackground(QPainter *painter, const QRectF &rect)
 {
+    if (m_clearBackdrop) return;
     QGraphicsView::drawBackground(painter, rect);
     if (m_background.isNull()) return;
     painter->save();

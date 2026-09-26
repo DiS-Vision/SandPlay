@@ -43,6 +43,12 @@ public:
     explicit Database(const QString &dbFilePath);
     ~Database();
     bool init();
+    void close();
+    // Closes the file and opens another. In-memory search is dropped.
+    bool reopen(const QString &dbFilePath);
+    QString filePath() const { return m_path; }
+    // Rewrites cover paths and skin JSON that still point at the old library folder.
+    bool replaceStoredPathPrefix(const QString &oldPrefix, const QString &newPrefix);
 
     // --- Tracks ---
     std::optional<Track> insertTrack(const Track &t);   // ON CONFLICT(path) DO NOTHING

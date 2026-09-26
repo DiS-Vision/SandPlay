@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QPalette>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QDir>
 
@@ -30,19 +31,30 @@ int main(int argc, char *argv[])
     QApplication::setWindowIcon(sandPlayLogoIcon());
 
     const QString appDataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(appDataDir);
+    QSettings librarySettings;
+    QString libraryRoot = librarySettings.value(QStringLiteral("library/root")).toString();
+    if (libraryRoot.isEmpty() || !QDir(libraryRoot).exists())
+        libraryRoot = appDataDir;
+    QDir().mkpath(libraryRoot);
 
-    Database db(QDir(appDataDir).filePath("library.db"));
+    Database db(QDir(libraryRoot).filePath(QStringLiteral("library.db")));
     if (!db.init()) {
-        qFatal("could not initialize the library database at %s", qUtf8Printable(appDataDir));
+        qFatal("could not initialize the library database at %s", qUtf8Printable(libraryRoot));
     }
 
-    CoverCache covers(QDir(appDataDir).filePath("covers"));
+    CoverCache covers(QDir(libraryRoot).filePath(QStringLiteral("covers")));
     LibraryManager library(db, covers);
 
     AudioEngine audio;
+    const int sampleRate = db.getSetting(QStringLiteral("sample_rate"), QStringLiteral("0")).toInt();
+    const int bitDepth = db.getSetting(QStringLiteral("bit_depth"), QStringLiteral("0")).toInt();
+    audio.setOutputPreference(sampleRate, bitDepth);
     if (!audio.init()) {
-        qWarning("audio device init failed — playback will not work, but the UI still runs");
+        audio.setOutputPreference(0, 0);
+        db.setSetting(QStringLiteral("sample_rate"), QStringLiteral("0"));
+        db.setSetting(QStringLiteral("bit_depth"), QStringLiteral("0"));
+        if (!audio.init())
+            qWarning("audio device init failed — playback will not work, but the UI still runs");
     }
 
     MainWindow window(db, audio, library, covers);
