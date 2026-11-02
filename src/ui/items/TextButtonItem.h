@@ -3,7 +3,7 @@
 #include "../DraggableItem.h"
 #include <QColor>
 
-// Square transport button with a drawn icon (not a text label).
+// Transport button with a drawn icon. Width and height follow the corner drag.
 class TextButtonItem : public DraggableItem {
     Q_OBJECT
 public:
@@ -25,9 +25,12 @@ public:
 
     void setGlyph(Glyph glyph);
     void setChecked(bool checked);
+    // 0 outline, 1 fill. Skip glyphs drop the accent stroke only in outline style.
+    void setButtonStyle(int style);
     void applyUiScale(qreal scale) override;
     void fitWithin(qreal maxWidth, qreal maxHeight) override;
     bool canResize() const override { return true; }
+    bool resizeKeepsRatio() const override { return false; }
     void resizeTo(qreal width, qreal height) override;
 
 protected:
@@ -38,7 +41,10 @@ private:
 
     Glyph m_glyph = Glyph::Previous;
     bool m_checked = false;
+    int m_buttonStyle = 0;
     QColor m_accent{"#c9974b"};
-    qreal m_side = 46.0;
+    qreal m_width = 46.0;
+    qreal m_height = 46.0;
     qreal m_fitScale = 0;
+    bool m_customSize = false;
 };

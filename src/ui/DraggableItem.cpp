@@ -52,7 +52,7 @@ void DraggableItem::clearSkinColor()
 
 void DraggableItem::setItemScale(qreal scale)
 {
-    m_itemScale = std::clamp(scale, 0.35, 3.0);
+    m_itemScale = std::clamp(scale, kMinControlScale, kMaxControlScale);
 }
 
 void DraggableItem::resizeTo(qreal, qreal) {}
@@ -107,12 +107,24 @@ void DraggableItem::mouseMoveEvent(QGraphicsSceneMouseEvent *event)
 {
     if (m_resizing) {
         const QPointF delta = event->scenePos() - m_pressScenePos;
+        // The only ceiling is the canvas under the item. A modest floor keeps the hit target.
+        qreal roomW = 1.0e6;
+        qreal roomH = 1.0e6;
+        if (QGraphicsScene *canvas = scene()) {
+            const QRectF bounds = canvas->sceneRect();
+            if (bounds.width() > 1.0 && bounds.height() > 1.0) {
+                roomW = std::max(28.0, bounds.right() - pos().x());
+                roomH = std::max(28.0, bounds.bottom() - pos().y());
+            }
+        }
         if (resizeKeepsRatio()) {
             const qreal base = std::max(m_resizeStartW, m_resizeStartH);
-            const qreal side = snapToSiblings(this, std::max(28.0, base + (delta.x() + delta.y()) / 2.0));
+            qreal side = snapToSiblings(this, std::max(28.0, base + (delta.x() + delta.y()) / 2.0));
+            side = std::clamp(side, 28.0, std::min(roomW, roomH));
             resizeTo(side, side);
         } else {
-            resizeTo(std::max(28.0, m_resizeStartW + delta.x()), m_resizeStartH);
+            resizeTo(std::clamp(m_resizeStartW + delta.x(), 28.0, roomW),
+                     std::clamp(m_resizeStartH + delta.y(), 28.0, roomH));
         }
         event->accept();
         return;

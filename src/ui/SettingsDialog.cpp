@@ -1,11 +1,19 @@
 #include "SettingsDialog.h"
 
+#include <QCheckBox>
 #include <QComboBox>
+#include <QDesktopServices>
+#include <QDoubleSpinBox>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLocale>
 #include <QPushButton>
+#include <QUrl>
 #include <QVBoxLayout>
+
+#include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -46,9 +54,102 @@ QGroupBox *block(const QString &title)
     return box;
 }
 
+// QDoubleSpinBox normally accepts only the widget locale's decimal mark.
+// Russian comma and a typed dot both have to become a pause in seconds.
+class GapSecondsBox : public QDoubleSpinBox {
+public:
+    explicit GapSecondsBox(QWidget *parent = nullptr)
+        : QDoubleSpinBox(parent)
+    {
+        setLocale(QLocale(QLocale::Russian));
+        setRange(0.0, 10.0);
+        setDecimals(2);
+        setSingleStep(0.1);
+        // Tracking would rewrite "0." into "0,00" before the rest of the
+        // number is typed. Commit on focus-out so both 0.33 and 0,33 stick.
+        setKeyboardTracking(false);
+        setGroupSeparatorShown(false);
+        setSuffix(QObject::tr(" с"));
+    }
+
+    QValidator::State validate(QString &input, int &pos) const override
+    {
+        Q_UNUSED(pos);
+        const QString body = stripped(input);
+        if (body.isEmpty())
+            return QValidator::Intermediate;
+
+        int separators = 0;
+        for (const QChar ch : body) {
+            if (ch == QLatin1Char('.') || ch == QLatin1Char(',')) {
+                ++separators;
+                continue;
+            }
+            if (!ch.isDigit())
+                return QValidator::Invalid;
+        }
+        if (separators > 1)
+            return QValidator::Invalid;
+
+        const int dot = body.indexOf(QLatin1Char('.'));
+        const int comma = body.indexOf(QLatin1Char(','));
+        const int sep = dot >= 0 ? dot : comma;
+        if (sep >= 0 && body.size() - sep - 1 > decimals())
+            return QValidator::Invalid;
+        if (sep == body.size() - 1)
+            return QValidator::Intermediate;
+
+        bool ok = false;
+        const double number = QLocale::c().toDouble(normalized(body), &ok);
+        if (!ok)
+            return QValidator::Intermediate;
+        if (number < minimum() || number > maximum())
+            return QValidator::Invalid;
+        return QValidator::Acceptable;
+    }
+
+    double valueFromText(const QString &text) const override
+    {
+        QString body = stripped(text);
+        if (body.endsWith(QLatin1Char('.')) || body.endsWith(QLatin1Char(',')))
+            body.chop(1);
+        bool ok = false;
+        const double number = QLocale::c().toDouble(normalized(body), &ok);
+        if (!ok)
+            return value();
+        const double clamped = std::clamp(number, minimum(), maximum());
+        return std::round(clamped * 100.0) / 100.0;
+    }
+
+    QString textFromValue(double val) const override
+    {
+        return QString::number(val, 'f', decimals()).replace(QLatin1Char('.'), QLatin1Char(','));
+    }
+
+private:
+    QString stripped(const QString &text) const
+    {
+        QString body = text;
+        const QString end = suffix();
+        if (!end.isEmpty() && body.endsWith(end))
+            body.chop(end.size());
+        const QString head = prefix();
+        if (!head.isEmpty() && body.startsWith(head))
+            body.remove(0, head.size());
+        return body.trimmed();
+    }
+
+    static QString normalized(QString body)
+    {
+        body.replace(QLatin1Char(','), QLatin1Char('.'));
+        return body;
+    }
+};
+
 } // namespace
 
-SettingsDialog::SettingsDialog(int sampleRate, int bitDepth, const QString &libraryPath, QWidget *parent)
+SettingsDialog::SettingsDialog(int sampleRate, int bitDepth, bool gapless, double trackGapSec,
+                               const QString &libraryPath, const UpdateStatus &update, QWidget *parent)
     : QDialog(parent)
 {
     setWindowTitle(tr("Настройки"));
@@ -72,6 +173,22 @@ SettingsDialog::SettingsDialog(int sampleRate, int bitDepth, const QString &libr
     fillDepths(m_depth);
     m_depth->setCurrentIndex(indexOfData(m_depth, bitDepth));
     audioLayout->addWidget(m_depth);
+    m_gaplessBox = new QCheckBox(tr("Стык без паузы"));
+    m_gaplessBox->setChecked(gapless);
+    m_gaplessBox->setCursor(Qt::PointingHandCursor);
+    audioLayout->addWidget(m_gaplessBox);
+    audioLayout->addWidget(fieldLabel(tr("Пауза между треками")));
+    m_gap = new GapSecondsBox;
+    if (trackGapSec < 0) trackGapSec = 0;
+    if (trackGapSec > 10) trackGapSec = 10;
+    trackGapSec = std::round(trackGapSec * 100.0) / 100.0;
+    m_gap->setValue(trackGapSec);
+    m_gap->setEnabled(!gapless);
+    m_gap->setToolTip(tr("Пока включён стык без паузы, эта пауза не вставляется. Можно ввести 0,33 или 0.33"));
+    m_gap->setStyleSheet(QStringLiteral(
+        "QDoubleSpinBox { background: #1b1e27; color: #ece8e0; border: 1px solid #2a2e3a; border-radius: 6px; padding: 4px 8px; }"
+        "QDoubleSpinBox:disabled { color: #6f6a62; }"));
+    audioLayout->addWidget(m_gap);
     auto *eq = new QPushButton(tr("Эквалайзер…"));
     eq->setCursor(Qt::PointingHandCursor);
     audioLayout->addWidget(eq);
@@ -84,6 +201,13 @@ SettingsDialog::SettingsDialog(int sampleRate, int bitDepth, const QString &libr
     };
     connect(m_rate, &QComboBox::currentIndexChanged, this, emitOutput);
     connect(m_depth, &QComboBox::currentIndexChanged, this, emitOutput);
+    connect(m_gaplessBox, &QCheckBox::toggled, this, [this](bool on) {
+        m_gap->setEnabled(!on);
+        if (!m_updating) emit gaplessChanged(on);
+    });
+    connect(m_gap, &QDoubleSpinBox::valueChanged, this, [this](double seconds) {
+        if (!m_updating) emit trackGapChanged(seconds);
+    });
 
     auto *look = block(tr("Оформление"));
     auto *lookLayout = qobject_cast<QVBoxLayout *>(look->layout());
@@ -127,6 +251,24 @@ SettingsDialog::SettingsDialog(int sampleRate, int bitDepth, const QString &libr
     bottom->addWidget(hints, 1);
     root->addLayout(bottom);
 
+    auto *updates = block(tr("Обновления"));
+    auto *updatesLayout = qobject_cast<QVBoxLayout *>(updates->layout());
+    m_versionLabel = new QLabel;
+    m_versionLabel->setWordWrap(true);
+    m_versionLabel->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+    updatesLayout->addWidget(m_versionLabel);
+    m_updateLabel = new QLabel;
+    m_updateLabel->setWordWrap(true);
+    updatesLayout->addWidget(m_updateLabel);
+    auto *release = new QPushButton(tr("Открыть страницу релиза"));
+    release->setCursor(Qt::PointingHandCursor);
+    updatesLayout->addWidget(release);
+    connect(release, &QPushButton::clicked, this, [this]() {
+        QDesktopServices::openUrl(m_updateStatus.pageUrl());
+    });
+    root->addWidget(updates);
+    setUpdateStatus(update);
+
     auto *close = new QPushButton(tr("Закрыть"));
     close->setCursor(Qt::PointingHandCursor);
     root->addWidget(close, 0, Qt::AlignRight);
@@ -144,4 +286,35 @@ void SettingsDialog::setOutput(int sampleRate, int bitDepth)
     m_rate->setCurrentIndex(indexOfData(m_rate, sampleRate));
     m_depth->setCurrentIndex(indexOfData(m_depth, bitDepth));
     m_updating = false;
+}
+
+void SettingsDialog::setUpdateStatus(const UpdateStatus &status)
+{
+    m_updateStatus = status;
+    const QString current = status.currentVersion.isEmpty()
+        ? QString::fromLatin1(kSandPlayVersion)
+        : status.currentVersion;
+    m_versionLabel->setText(tr("Текущая версия: %1").arg(current));
+
+    QString detail;
+    bool highlight = false;
+    switch (status.state) {
+    case UpdateStatus::State::Checking:
+        detail = tr("Проверка обновлений…");
+        break;
+    case UpdateStatus::State::UpdateAvailable:
+        detail = tr("Доступна версия %1").arg(status.latestTag);
+        highlight = true;
+        break;
+    case UpdateStatus::State::UpToDate:
+        detail = tr("Новых версий нет");
+        break;
+    case UpdateStatus::State::Failed:
+        detail = tr("Не удалось проверить обновления");
+        break;
+    }
+    m_updateLabel->setText(detail);
+    m_updateLabel->setStyleSheet(highlight
+        ? QStringLiteral("color: #c9974b; background: transparent; border: none;")
+        : QStringLiteral("color: #b7b1a6; background: transparent; border: none;"));
 }

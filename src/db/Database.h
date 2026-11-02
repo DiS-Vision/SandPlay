@@ -22,6 +22,11 @@ struct Playlist {
     qint64 id = -1;
     QString name;
     QString coverPath;   // manually-set cover, local disk path — empty if none chosen yet
+    // -1 automatic (guess from the track count until the user picks one).
+    // 0 playlist, 1 single, 2 mini-album, 3 album. A value >= 0 is kept
+    // when tracks are added or removed.
+    int category = -1;
+    int trackCount = 0;
 };
 
 struct WatchedFolder {
@@ -75,9 +80,11 @@ public:
     void clearPlaylistCovers(const QString &coverPath);
 
     // --- Playlists ---
-    qint64 createPlaylist(const QString &name);
+    // category < 0 leaves the row automatic. 0..3 stores the user's choice.
+    qint64 createPlaylist(const QString &name, int category = -1);
     QVector<Playlist> allPlaylists() const;
     bool renamePlaylist(qint64 playlistId, const QString &name);
+    bool setPlaylistCategory(qint64 playlistId, int category);
     bool deletePlaylist(qint64 playlistId);
     static constexpr int kPlaylistTrackLimit = 2000;
     int playlistTrackCount(qint64 playlistId) const;

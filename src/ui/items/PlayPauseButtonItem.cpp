@@ -1,6 +1,7 @@
 #include "PlayPauseButtonItem.h"
 #include <QPainter>
 #include <algorithm>
+#include <cmath>
 
 PlayPauseButtonItem::PlayPauseButtonItem(QGraphicsItem *parent)
     : DraggableItem("play_pause_button", parent)
@@ -56,22 +57,25 @@ void PlayPauseButtonItem::setAccent(const QColor &color)
 void PlayPauseButtonItem::applyUiScale(qreal scale)
 {
     prepareGeometryChange();
+    if (m_customSize && m_fitScale >= 0.05) {
+        const qreal factor = scale / m_fitScale;
+        if (std::abs(factor - 1.0) > 0.001)
+            m_diameter = std::max(28.0, m_diameter * factor);
+    } else if (!m_customSize) {
+        m_diameter = std::max(28.0, 58.0 * scale * itemScale());
+    }
     m_fitScale = scale;
-    m_diameter = std::clamp(58.0 * scale * itemScale(), 28.0, 160.0);
     update();
 }
 
 void PlayPauseButtonItem::resizeTo(qreal width, qreal height)
 {
-    const qreal side = std::min(width, height);
+    const qreal side = std::max(28.0, std::min(width, height));
     prepareGeometryChange();
-    if (m_fitScale < 0.05) {
-        m_diameter = std::clamp(side, 28.0, 120.0);
-        update();
-        return;
-    }
-    setItemScale(side / (58.0 * m_fitScale));
-    m_diameter = std::clamp(58.0 * m_fitScale * itemScale(), 28.0, 160.0);
+    m_diameter = side;
+    m_customSize = true;
+    if (m_fitScale >= 0.05)
+        setItemScale(side / (58.0 * m_fitScale));
     update();
 }
 
@@ -80,11 +84,13 @@ void PlayPauseButtonItem::fitWithin(qreal maxWidth, qreal maxHeight)
     const qreal cap = std::min(maxWidth, maxHeight);
     if (m_diameter <= cap) return;
     prepareGeometryChange();
-    m_diameter = std::max(32.0, cap);
+    m_diameter = std::max(28.0, cap);
     update();
 }
 
 void PlayPauseButtonItem::applySkinColor(const QColor &color)
 {
-    setAccent(color);
+    if (!color.isValid()) return;
+    m_accent = color;
+    update();
 }

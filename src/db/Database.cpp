@@ -263,7 +263,8 @@ bool Database::init()
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             name       TEXT NOT NULL,
             cover_path TEXT,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            category   INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS playlist_tracks (
@@ -328,6 +329,21 @@ bool Database::init()
     }
     if (!q.exec("INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild')"))
         qWarning() << "fts rebuild failed:" << q.lastError().text();
+
+    // Existing libraries were created before playlists.category. CREATE TABLE
+    // does not add columns, so migrate in place and leave rows NULL (automatic).
+    bool hasCategory = false;
+    QSqlQuery info(database);
+    if (info.exec(QStringLiteral("PRAGMA table_info(playlists)"))) {
+        while (info.next()) {
+            if (info.value(1).toString().compare(QLatin1String("category"), Qt::CaseInsensitive) == 0)
+                hasCategory = true;
+        }
+    }
+    if (!hasCategory) {
+        if (!q.exec(QStringLiteral("ALTER TABLE playlists ADD COLUMN category INTEGER")))
+            qWarning() << "playlist category migration failed:" << q.lastError().text();
+    }
 
     return true;
 }
@@ -568,10 +584,15 @@ void Database::clearPlaylistCovers(const QString &coverPath)
     q.exec();
 }
 
-qint64 Database::createPlaylist(const QString &name)
+qint64 Database::createPlaylist(const QString &name, int category)
 {
     QSqlQuery q(db());
-    q.prepare("INSERT INTO playlists (name, created_at) VALUES (:name, :now)");
+    if (category < 0) {
+        q.prepare("INSERT INTO playlists (name, created_at) VALUES (:name, :now)");
+    } else {
+        q.prepare("INSERT INTO playlists (name, created_at, category) VALUES (:name, :now, :category)");
+        q.bindValue(":category", category);
+    }
     q.bindValue(":name", name);
     q.bindValue(":now", QDateTime::currentSecsSinceEpoch());
     if (!q.exec()) { qWarning() << q.lastError().text(); return -1; }
@@ -583,6 +604,16 @@ bool Database::renamePlaylist(qint64 playlistId, const QString &name)
     QSqlQuery q(db());
     q.prepare("UPDATE playlists SET name = :name WHERE id = :id");
     q.bindValue(":name", name);
+    q.bindValue(":id", playlistId);
+    return q.exec();
+}
+
+bool Database::setPlaylistCategory(qint64 playlistId, int category)
+{
+    if (category < 0 || category > 3) return false;
+    QSqlQuery q(db());
+    q.prepare("UPDATE playlists SET category = :category WHERE id = :id");
+    q.bindValue(":category", category);
     q.bindValue(":id", playlistId);
     return q.exec();
 }
@@ -606,9 +637,21 @@ bool Database::deletePlaylist(qint64 playlistId)
 
 QVector<Playlist> Database::allPlaylists() const
 {
-    QSqlQuery q("SELECT id, name, cover_path FROM playlists ORDER BY created_at", db());
+    QSqlQuery q(QStringLiteral(
+        "SELECT p.id, p.name, p.cover_path, p.category, "
+        "(SELECT COUNT(*) FROM playlist_tracks t WHERE t.playlist_id = p.id) "
+        "FROM playlists p ORDER BY p.created_at"), db());
     QVector<Playlist> out;
-    while (q.next()) out.push_back({ q.value(0).toLongLong(), q.value(1).toString(), q.value(2).toString() });
+    while (q.next()) {
+        Playlist playlist;
+        playlist.id = q.value(0).toLongLong();
+        playlist.name = q.value(1).toString();
+        playlist.coverPath = q.value(2).toString();
+        const QVariant category = q.value(3);
+        playlist.category = category.isNull() ? -1 : category.toInt();
+        playlist.trackCount = q.value(4).toInt();
+        out.push_back(playlist);
+    }
     return out;
 }
 

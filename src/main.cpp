@@ -4,6 +4,7 @@
 #include <QStandardPaths>
 #include <QDir>
 
+#include "AppVersion.h"
 #include "db/Database.h"
 #include "ui/SandPlayLogo.h"
 #include "audio/AudioEngine.h"
@@ -27,6 +28,7 @@ int main(int argc, char *argv[])
     // Keep this id stable: it is the AppData folder that already holds the library.
     QApplication::setApplicationName("music-player");
     QApplication::setApplicationDisplayName(QStringLiteral("SandPlay"));
+    QApplication::setApplicationVersion(QString::fromLatin1(kSandPlayVersion));
     QApplication::setOrganizationName("local");
     QApplication::setWindowIcon(sandPlayLogoIcon());
 

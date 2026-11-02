@@ -3,6 +3,7 @@
 #include <QPainterPath>
 #include <QPen>
 #include <algorithm>
+#include <cmath>
 
 TextButtonItem::TextButtonItem(QString elementId, Glyph glyph, QGraphicsItem *parent)
     : DraggableItem(std::move(elementId), parent), m_glyph(glyph)
@@ -11,7 +12,7 @@ TextButtonItem::TextButtonItem(QString elementId, Glyph glyph, QGraphicsItem *pa
 
 QRectF TextButtonItem::boundingRect() const
 {
-    return QRectF(0, 0, m_side, m_side);
+    return QRectF(0, 0, m_width, m_height);
 }
 
 void TextButtonItem::paintGlyph(QPainter *painter, const QRectF &box) const
@@ -107,15 +108,17 @@ void TextButtonItem::paint(QPainter *painter, const QStyleOptionGraphicsItem *, 
         return;
     }
     const QRectF r = boundingRect().adjusted(0.5, 0.5, -0.5, -0.5);
+    const qreal unit = std::max(28.0, std::min(m_width, m_height));
     painter->setPen(Qt::NoPen);
     painter->setBrush(engaged ? m_accent : QColor("#242833"));
-    painter->drawRoundedRect(r, m_side * 0.22, m_side * 0.22);
-    if (!engaged) {
+    painter->drawRoundedRect(r, unit * 0.22, unit * 0.22);
+    const bool skipGlyph = m_glyph == Glyph::Previous || m_glyph == Glyph::Next;
+    if (!engaged && !(m_buttonStyle == 0 && skipGlyph)) {
         painter->setBrush(Qt::NoBrush);
-        painter->setPen(QPen(m_accent, std::max(1.2, m_side * 0.035)));
-        painter->drawRoundedRect(r.adjusted(1.2, 1.2, -1.2, -1.2), m_side * 0.2, m_side * 0.2);
+        painter->setPen(QPen(m_accent, std::max(1.2, unit * 0.035)));
+        painter->drawRoundedRect(r.adjusted(1.2, 1.2, -1.2, -1.2), unit * 0.2, unit * 0.2);
     }
-    const qreal pad = m_side * 0.22;
+    const qreal pad = unit * 0.22;
     paintGlyph(painter, boundingRect().adjusted(pad, pad, -pad, -pad));
 }
 
@@ -131,34 +134,50 @@ void TextButtonItem::setChecked(bool checked)
     update();
 }
 
+void TextButtonItem::setButtonStyle(int style)
+{
+    const int next = style == 1 ? 1 : 0;
+    if (m_buttonStyle == next) return;
+    m_buttonStyle = next;
+    update();
+}
+
 void TextButtonItem::applyUiScale(qreal scale)
 {
     prepareGeometryChange();
+    if (m_customSize && m_fitScale >= 0.05) {
+        const qreal factor = scale / m_fitScale;
+        if (std::abs(factor - 1.0) > 0.001) {
+            m_width = std::max(28.0, m_width * factor);
+            m_height = std::max(28.0, m_height * factor);
+        }
+    } else if (!m_customSize) {
+        const qreal side = std::max(28.0, 48.0 * scale * itemScale());
+        m_width = side;
+        m_height = side;
+    }
     m_fitScale = scale;
-    m_side = std::clamp(48.0 * scale * itemScale(), 28.0, 160.0);
     update();
 }
 
 void TextButtonItem::resizeTo(qreal width, qreal height)
 {
-    const qreal side = std::min(width, height);
     prepareGeometryChange();
-    if (m_fitScale < 0.05) {
-        m_side = std::clamp(side, 28.0, 140.0);
-        update();
-        return;
-    }
-    setItemScale(side / (48.0 * m_fitScale));
-    m_side = std::clamp(48.0 * m_fitScale * itemScale(), 28.0, 160.0);
+    m_width = std::max(28.0, width);
+    m_height = std::max(28.0, height);
+    m_customSize = true;
+    if (m_fitScale >= 0.05)
+        setItemScale(std::min(m_width, m_height) / (48.0 * m_fitScale));
     update();
 }
 
 void TextButtonItem::fitWithin(qreal maxWidth, qreal maxHeight)
 {
-    const qreal cap = std::min(maxWidth, maxHeight);
-    if (m_side <= cap) return;
+    if (m_width <= maxWidth && m_height <= maxHeight) return;
+    const qreal factor = std::min(maxWidth / std::max(1.0, m_width), maxHeight / std::max(1.0, m_height));
     prepareGeometryChange();
-    m_side = std::max(28.0, cap);
+    m_width = std::max(28.0, m_width * factor);
+    m_height = std::max(28.0, m_height * factor);
     update();
 }
 

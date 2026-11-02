@@ -25,4 +25,5 @@ private:
     QColor m_accent{"#c9974b"};
     qreal m_diameter = 40.0;
     qreal m_fitScale = 0;
+    bool m_customSize = false;
 };

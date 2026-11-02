@@ -33,6 +33,8 @@ public:
     RepeatMode repeatMode() const { return m_repeatMode; }
 
     std::optional<Track> current() const;
+    // The track advance() would start, without moving the cursor.
+    std::optional<Track> upcoming() const;
     const QVector<Track>& tracks() const { return m_tracks; }
     int currentIndex() const { return m_currentIndex; }
 

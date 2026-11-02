@@ -32,7 +32,10 @@ public:
     bool hasSkinColor() const { return m_hasSkinColor; }
     QColor skinColor() const { return m_skinColor; }
 
-    // Per-button size, 0.6–1.8, kept in the skin separately from the window fit.
+    // Multiplier kept in the skin, separate from the window fit.
+    // The upper end is large enough for a transport button to fill the canvas.
+    static constexpr qreal kMinControlScale = 0.35;
+    static constexpr qreal kMaxControlScale = 80.0;
     void setItemScale(qreal scale);
     qreal itemScale() const { return m_itemScale; }
 

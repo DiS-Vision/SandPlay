@@ -53,7 +53,14 @@ ma_format formatForDepth(int bitDepth)
 
 struct AudioEngine::Impl {
     ma_engine engine{};
-    ma_sound sound{};
+    // Slot 0/1 trade places: one is the audible track, the other is only the
+    // next track opened ahead of the boundary. Never more than one extra sound.
+    ma_sound voices[2]{};
+    bool slotLoaded[2]{};
+    QString slotPath[2];
+    int current = 0;
+    int upcoming = -1;
+    bool gapless = false;
     ma_device device{};
     ma_biquad_node bands[kBands]{};
     float gains[kBands]{};
@@ -61,7 +68,6 @@ struct AudioEngine::Impl {
     ma_uint32 channels = 2;
     ma_format playbackFormat = ma_format_f32;
     bool engineReady = false;
-    bool soundLoaded = false;
     bool bandsReady = false;
     bool deviceReady = false;
 
@@ -123,10 +129,16 @@ void AudioEngine::shutdown()
     m_pollTimer.stop();
     if (m_impl->deviceReady)
         ma_device_stop(&m_impl->device);
-    if (m_impl->soundLoaded) {
-        ma_sound_uninit(&m_impl->sound);
-        m_impl->soundLoaded = false;
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!m_impl->slotLoaded[slot]) continue;
+        ma_sound_uninit(&m_impl->voices[slot]);
+        m_impl->slotLoaded[slot] = false;
+        m_impl->slotPath[slot].clear();
     }
+    m_impl->upcoming = -1;
+    m_impl->current = 0;
+    m_loadedPath.clear();
+    m_seamlessHandoff = false;
     if (m_impl->bandsReady) {
         for (int i = 0; i < kBands; ++i)
             ma_biquad_node_uninit(&m_impl->bands[i], nullptr);
@@ -254,34 +266,175 @@ void AudioEngine::restorePlayback(const QString &path, qint64 position, bool pla
     if (!playing) pause();
 }
 
-bool AudioEngine::loadAndPlay(const QString &path)
+void AudioEngine::attachSound(ma_sound *sound)
 {
-    if (!m_impl->engineReady) return false;
+    if (m_impl->bandsReady && sound)
+        ma_node_attach_output_bus(reinterpret_cast<ma_node *>(sound), 0, &m_impl->bands[0], 0);
+}
 
-    if (m_impl->soundLoaded) {
-        ma_sound_uninit(&m_impl->sound);
-        m_impl->soundLoaded = false;
-        m_loadedPath.clear();
-    }
+void AudioEngine::uninitSlot(int slot)
+{
+    if (slot < 0 || slot > 1 || !m_impl->slotLoaded[slot]) return;
+    ma_sound_stop(&m_impl->voices[slot]);
+    ma_sound_uninit(&m_impl->voices[slot]);
+    m_impl->slotLoaded[slot] = false;
+    m_impl->slotPath[slot].clear();
+    if (m_impl->upcoming == slot) m_impl->upcoming = -1;
+}
 
+bool AudioEngine::openSlot(int slot, const QString &path)
+{
+    if (slot < 0 || slot > 1 || !m_impl->engineReady) return false;
+    uninitSlot(slot);
     const QByteArray pathUtf8 = path.toUtf8();
     // MA_SOUND_FLAG_STREAM: decode as playback advances, don't slurp the
     // whole file into RAM up front — this is what keeps memory flat
-    // regardless of track length or format.
-    ma_result result = ma_sound_init_from_file(
+    // regardless of track length or format. The next track is a second
+    // streamed sound, so only its first pages sit in memory ahead of time.
+    const ma_result result = ma_sound_init_from_file(
         &m_impl->engine, pathUtf8.constData(),
-        MA_SOUND_FLAG_STREAM, nullptr, nullptr, &m_impl->sound);
+        MA_SOUND_FLAG_STREAM, nullptr, nullptr, &m_impl->voices[slot]);
     if (result != MA_SUCCESS) {
         emit errorOccurred(QStringLiteral("failed to open %1 (%2)").arg(path).arg(int(result)));
         return false;
     }
-    m_impl->soundLoaded = true;
-    m_loadedPath = path;
-    if (m_impl->bandsReady)
-        ma_node_attach_output_bus(reinterpret_cast<ma_node *>(&m_impl->sound), 0, &m_impl->bands[0], 0);
-    m_wasAtEnd = false;
+    m_impl->slotLoaded[slot] = true;
+    m_impl->slotPath[slot] = path;
+    attachSound(&m_impl->voices[slot]);
+    return true;
+}
 
-    ma_sound_start(&m_impl->sound);
+void AudioEngine::adoptNext(bool markHandoff)
+{
+    const int next = m_impl->upcoming;
+    if (next < 0 || !m_impl->slotLoaded[next]) return;
+    const int old = m_impl->current;
+    m_impl->upcoming = -1;
+    if (old != next) uninitSlot(old);
+    m_impl->current = next;
+    m_loadedPath = m_impl->slotPath[next];
+    m_wasAtEnd = false;
+    m_seamlessHandoff = markHandoff;
+    m_boundaryWait.invalidate();
+}
+
+void AudioEngine::scheduleNext(bool rewind)
+{
+    if (!m_impl->gapless || m_impl->upcoming < 0 || !m_impl->slotLoaded[m_impl->upcoming])
+        return;
+    if (!m_impl->slotLoaded[m_impl->current]) return;
+
+    ma_sound *next = &m_impl->voices[m_impl->upcoming];
+    if (!rewind && ma_sound_is_playing(next)) return;
+    if (rewind) {
+        ma_sound_stop(next);
+        ma_sound_seek_to_pcm_frame(next, 0);
+    }
+
+    ma_sound *current = &m_impl->voices[m_impl->current];
+    ma_uint64 length = 0;
+    if (ma_sound_get_length_in_pcm_frames(current, &length) != MA_SUCCESS || length == 0)
+        return;
+
+    // Cursor and engine time are both in the engine rate (the resource
+    // manager decodes to it). Sample them without a device callback in
+    // between so the scheduled start lands on the last frame.
+    ma_uint64 endAt = 0;
+    bool stable = false;
+    for (int attempt = 0; attempt < 8 && !stable; ++attempt) {
+        const ma_uint64 t0 = ma_engine_get_time_in_pcm_frames(&m_impl->engine);
+        ma_uint64 cursor = 0;
+        if (ma_sound_get_cursor_in_pcm_frames(current, &cursor) != MA_SUCCESS) return;
+        const ma_uint64 t1 = ma_engine_get_time_in_pcm_frames(&m_impl->engine);
+        if (t0 != t1) continue;
+        if (cursor > length) cursor = length;
+        endAt = t1 + (length - cursor);
+        stable = true;
+    }
+    if (!stable) {
+        ma_uint64 cursor = 0;
+        if (ma_sound_get_cursor_in_pcm_frames(current, &cursor) != MA_SUCCESS) return;
+        if (cursor > length) cursor = length;
+        endAt = ma_engine_get_time_in_pcm_frames(&m_impl->engine) + (length - cursor);
+    }
+    const ma_uint64 now = ma_engine_get_time_in_pcm_frames(&m_impl->engine);
+    if (endAt < now) endAt = now;
+    ma_sound_set_start_time_in_pcm_frames(next, endAt);
+    ma_sound_set_stop_time_in_pcm_frames(next, ~(ma_uint64)0);
+    if (isPlaying()) ma_sound_start(next);
+}
+
+void AudioEngine::setGapless(bool on)
+{
+    m_impl->gapless = on;
+    if (!on) clearNext();
+}
+
+void AudioEngine::clearNext()
+{
+    if (m_impl->upcoming < 0) return;
+    uninitSlot(m_impl->upcoming);
+}
+
+void AudioEngine::prepareNext(const QString &path)
+{
+    if (!m_impl->engineReady || !m_impl->gapless || path.isEmpty()
+        || !m_impl->slotLoaded[m_impl->current]) {
+        clearNext();
+        return;
+    }
+    const int slot = 1 - m_impl->current;
+    if (m_impl->upcoming == slot && m_impl->slotLoaded[slot] && m_impl->slotPath[slot] == path) {
+        scheduleNext(false);
+        return;
+    }
+    clearNext();
+    if (!openSlot(slot, path)) return;
+    m_impl->upcoming = slot;
+    scheduleNext(false);
+}
+
+bool AudioEngine::loadAndPlay(const QString &path)
+{
+    if (!m_impl->engineReady) return false;
+
+    if (m_seamlessHandoff && m_loadedPath == path && isPlaying()) {
+        m_seamlessHandoff = false;
+        m_wasAtEnd = false;
+        m_boundaryWait.invalidate();
+        m_pollTimer.start();
+        return true;
+    }
+    m_seamlessHandoff = false;
+
+    const int queued = m_impl->upcoming;
+    if (queued >= 0 && m_impl->slotLoaded[queued] && m_impl->slotPath[queued] == path) {
+        const bool already = ma_sound_is_playing(&m_impl->voices[queued]);
+        if (!already) {
+            ma_sound_stop(&m_impl->voices[queued]);
+            ma_sound_set_start_time_in_pcm_frames(&m_impl->voices[queued], 0);
+            ma_sound_set_stop_time_in_pcm_frames(&m_impl->voices[queued], ~(ma_uint64)0);
+            ma_sound_seek_to_pcm_frame(&m_impl->voices[queued], 0);
+        }
+        adoptNext(false);
+        if (!isPlaying())
+            ma_sound_start(&m_impl->voices[m_impl->current]);
+        m_wasAtEnd = false;
+        m_boundaryWait.invalidate();
+        m_pollTimer.start();
+        emit playbackStateChanged(true);
+        return true;
+    }
+
+    clearNext();
+    if (!openSlot(m_impl->current, path)) {
+        m_loadedPath.clear();
+        return false;
+    }
+    m_loadedPath = path;
+    m_wasAtEnd = false;
+    m_boundaryWait.invalidate();
+    ma_sound_start(&m_impl->voices[m_impl->current]);
     m_pollTimer.start();
     emit playbackStateChanged(true);
     return true;
@@ -289,39 +442,48 @@ bool AudioEngine::loadAndPlay(const QString &path)
 
 void AudioEngine::pause()
 {
-    if (!m_impl->soundLoaded) return;
-    ma_sound_stop(&m_impl->sound); // miniaudio's "stop" just halts the cursor, doesn't rewind
+    if (!m_impl->slotLoaded[m_impl->current]) return;
+    ma_sound_stop(&m_impl->voices[m_impl->current]); // miniaudio's "stop" just halts the cursor, doesn't rewind
+    if (m_impl->upcoming >= 0 && m_impl->slotLoaded[m_impl->upcoming])
+        ma_sound_stop(&m_impl->voices[m_impl->upcoming]);
     m_pollTimer.stop();
+    m_boundaryWait.invalidate();
     emit playbackStateChanged(false);
 }
 
 void AudioEngine::resume()
 {
-    if (!m_impl->soundLoaded) return;
-    ma_sound_start(&m_impl->sound);
+    if (!m_impl->slotLoaded[m_impl->current]) return;
+    ma_sound_start(&m_impl->voices[m_impl->current]);
+    scheduleNext(false);
     m_pollTimer.start();
     emit playbackStateChanged(true);
 }
 
 void AudioEngine::stop()
 {
-    if (!m_impl->soundLoaded) return;
-    ma_sound_stop(&m_impl->sound);
-    ma_sound_uninit(&m_impl->sound);
-    m_impl->soundLoaded = false;
+    const bool had = m_impl->slotLoaded[0] || m_impl->slotLoaded[1];
+    m_boundaryWait.invalidate();
+    m_seamlessHandoff = false;
+    clearNext();
+    uninitSlot(m_impl->current);
     m_loadedPath.clear();
     m_pollTimer.stop();
-    emit playbackStateChanged(false);
+    if (had) emit playbackStateChanged(false);
 }
 
 void AudioEngine::seekToMs(qint64 ms)
 {
-    if (!m_impl->soundLoaded) return;
+    if (!m_impl->slotLoaded[m_impl->current]) return;
+    ma_sound *sound = &m_impl->voices[m_impl->current];
     ma_uint32 sampleRate = 0;
-    ma_sound_get_data_format(&m_impl->sound, nullptr, nullptr, &sampleRate, nullptr, 0);
+    ma_sound_get_data_format(sound, nullptr, nullptr, &sampleRate, nullptr, 0);
     if (sampleRate == 0) return;
     const ma_uint64 frame = static_cast<ma_uint64>(ms) * sampleRate / 1000;
-    ma_sound_seek_to_pcm_frame(&m_impl->sound, frame);
+    ma_sound_seek_to_pcm_frame(sound, frame);
+    m_wasAtEnd = false;
+    m_boundaryWait.invalidate();
+    scheduleNext(true);
 }
 
 void AudioEngine::setVolume(float volume01)
@@ -352,40 +514,70 @@ QString AudioEngine::equalizerBandLabel(int band) const
 
 qint64 AudioEngine::positionMs() const
 {
-    if (!m_impl->soundLoaded) return 0;
+    if (!m_impl->slotLoaded[m_impl->current]) return 0;
+    ma_sound *sound = const_cast<ma_sound *>(&m_impl->voices[m_impl->current]);
     ma_uint64 cursor = 0;
-    ma_sound_get_cursor_in_pcm_frames(const_cast<ma_sound*>(&m_impl->sound), &cursor);
+    ma_sound_get_cursor_in_pcm_frames(sound, &cursor);
     ma_uint32 sampleRate = 0;
-    ma_sound_get_data_format(const_cast<ma_sound*>(&m_impl->sound), nullptr, nullptr, &sampleRate, nullptr, 0);
+    ma_sound_get_data_format(sound, nullptr, nullptr, &sampleRate, nullptr, 0);
     if (sampleRate == 0) return 0;
     return static_cast<qint64>(cursor) * 1000 / sampleRate;
 }
 
 qint64 AudioEngine::durationMs() const
 {
-    if (!m_impl->soundLoaded) return 0;
+    if (!m_impl->slotLoaded[m_impl->current]) return 0;
+    ma_sound *sound = const_cast<ma_sound *>(&m_impl->voices[m_impl->current]);
     ma_uint64 frames = 0;
-    ma_sound_get_length_in_pcm_frames(const_cast<ma_sound*>(&m_impl->sound), &frames);
+    ma_sound_get_length_in_pcm_frames(sound, &frames);
     ma_uint32 sampleRate = 0;
-    ma_sound_get_data_format(const_cast<ma_sound*>(&m_impl->sound), nullptr, nullptr, &sampleRate, nullptr, 0);
+    ma_sound_get_data_format(sound, nullptr, nullptr, &sampleRate, nullptr, 0);
     if (sampleRate == 0) return 0;
     return static_cast<qint64>(frames) * 1000 / sampleRate;
 }
 
 bool AudioEngine::isPlaying() const
 {
-    return m_impl->soundLoaded && ma_sound_is_playing(const_cast<ma_sound*>(&m_impl->sound));
+    return m_impl->slotLoaded[m_impl->current]
+        && ma_sound_is_playing(&m_impl->voices[m_impl->current]);
 }
 
 void AudioEngine::pollProgress()
 {
-    if (!m_impl->soundLoaded) return;
-    emit positionChanged(positionMs());
+    const int current = m_impl->current;
+    if (!m_impl->slotLoaded[current]) return;
 
-    const bool atEnd = ma_sound_at_end(&m_impl->sound);
+    const int next = m_impl->upcoming;
+    const bool haveNext = m_impl->gapless && next >= 0 && m_impl->slotLoaded[next];
+    const bool atEnd = ma_sound_at_end(&m_impl->voices[current]);
+    if (haveNext && atEnd) {
+        if (ma_sound_is_playing(&m_impl->voices[next])) {
+            adoptNext(true);
+            emit positionChanged(positionMs());
+            emit trackFinished();
+            return;
+        }
+        // The scheduled start should already have crossed. If it hasn't
+        // within half a second, hand the preloaded sound to loadAndPlay.
+        if (!m_boundaryWait.isValid())
+            m_boundaryWait.start();
+        else if (m_boundaryWait.elapsed() > 500) {
+            m_boundaryWait.invalidate();
+            m_wasAtEnd = true;
+            m_pollTimer.stop();
+            emit positionChanged(durationMs());
+            emit trackFinished();
+            return;
+        }
+        emit positionChanged(durationMs());
+        return;
+    }
+
+    m_boundaryWait.invalidate();
+    emit positionChanged(positionMs());
     if (atEnd && !m_wasAtEnd) {
         m_wasAtEnd = true;
         m_pollTimer.stop();
-        emit trackFinished(); // PlaybackQueue::onTrackFinished() picks the next track
+        emit trackFinished();
     }
 }

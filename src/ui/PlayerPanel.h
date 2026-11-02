@@ -20,6 +20,7 @@
 class QLabel;
 class QSplitter;
 class QListView;
+class QToolButton;
 
 // Full-window player. The left side is a skin canvas (buttons keep the
 // positions and colors the user chose). The queue stays on the right.
@@ -30,6 +31,7 @@ public:
 
     SkinCanvas *canvas() const { return m_canvas; }
     QListView *queueView() const { return m_queueView; }
+    QToolButton *sleepButton() const { return m_sleepButton; }
 
     void setTrack(const std::optional<Track> &track);
     void setCover(const QPixmap &pixmap);
@@ -91,6 +93,8 @@ private:
     QLabel *m_editHint = nullptr;
     QListView *m_queueView = nullptr;
     QLabel *m_queueEmpty = nullptr;
+    QToolButton *m_sleepButton = nullptr;
+    QWidget *m_queueCard = nullptr;
 
     SkinCanvas *m_canvas = nullptr;
     CoverArtItem *m_cover = nullptr;

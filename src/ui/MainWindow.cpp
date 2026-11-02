@@ -33,6 +33,10 @@
 #include <QCursor>
 #include <QDialog>
 #include <QFormLayout>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QWindow>
+#include <QScrollArea>
 #include <QFileInfo>
 #include <QLabel>
 #include <QPushButton>
@@ -55,7 +59,13 @@
 #include <QComboBox>
 #include "SmoothScroll.h"
 #include "SettingsDialog.h"
+#include "UpdateChecker.h"
+#include <QDesktopServices>
+#include <QProcess>
+#include <QProgressDialog>
 #include <QTimer>
+#include <QDateTime>
+#include <QUrl>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
@@ -207,6 +217,10 @@ QColor mutedSelection(const QColor &accent)
     return mixed;
 }
 
+// Same corner radius as the library cover, and the side it has in a 72px row.
+constexpr int kLibraryCoverRadius = 8;
+constexpr int kLibraryCoverRow = 72;
+
 class TrackCoverDelegate : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
@@ -222,8 +236,16 @@ public:
             painter->save();
             painter->setRenderHint(QPainter::Antialiasing);
             painter->setRenderHint(QPainter::SmoothPixmapTransform);
+            QString shape;
+            for (const QWidget *widget = option.widget; widget && shape.isEmpty(); widget = widget->parentWidget())
+                shape = widget->property("coverShape").toString();
             QPainterPath clip;
-            clip.addRoundedRect(box, 8, 8);
+            if (shape == QLatin1String("vinyl"))
+                clip.addEllipse(box);
+            else if (shape == QLatin1String("square"))
+                clip.addRect(box);
+            else
+                clip.addRoundedRect(box, kLibraryCoverRadius, kLibraryCoverRadius);
             painter->setClipPath(clip);
             const QPixmap thumb = index.data(Qt::DecorationRole).value<QPixmap>();
             if (thumb.isNull()) {
@@ -262,6 +284,20 @@ public:
 
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
+        if (index.data(PlaylistModel::HeaderRole).toBool()) {
+            painter->save();
+            painter->fillRect(option.rect, QColor(QStringLiteral("#12141a")));
+            painter->setPen(QColor(QStringLiteral("#9a9388")));
+            QFont font = option.font;
+            font.setBold(true);
+            painter->setFont(font);
+            const QRect textRect = option.rect.adjusted(12, 0, -8, 0);
+            const QString label = index.data(Qt::DisplayRole).toString();
+            painter->drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
+                              painter->fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
+            painter->restore();
+            return;
+        }
         const bool selected = option.state.testFlag(QStyle::State_Selected);
         painter->fillRect(option.rect, selected ? gSelection : QColor(QStringLiteral("#1b1e27")));
         QStyleOptionViewItem opt(option);
@@ -269,22 +305,38 @@ public:
         painter->save();
         painter->setRenderHint(QPainter::Antialiasing);
         painter->setRenderHint(QPainter::SmoothPixmapTransform);
-        QRect textRect = opt.rect.adjusted(10, 0, -10, 0);
-        if (!opt.icon.isNull()) {
-            const int side = 28;
-            const QRect iconRect(textRect.left(), textRect.center().y() - side / 2, side, side);
-            QPainterPath clip;
-            clip.addRoundedRect(QRectF(iconRect), 6, 6);
-            painter->setClipPath(clip);
-            painter->drawPixmap(iconRect, opt.icon.pixmap(side, side));
-            painter->setClipping(false);
-            textRect.setLeft(iconRect.right() + 8);
+        QRect textRect = opt.rect.adjusted(8, 0, -10, 0);
+        const int side = std::min(kLibraryCoverRow - 16, std::min(opt.rect.width(), opt.rect.height()) - 16);
+        if (side >= 8) {
+            const int inset = std::max(0, (opt.rect.height() - side) / 2);
+            const QRect box(opt.rect.left() + inset, opt.rect.top() + inset, side, side);
+            if (opt.icon.isNull()) {
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(QColor(QStringLiteral("#8b8a86")));
+                painter->drawRoundedRect(QRectF(box), kLibraryCoverRadius, kLibraryCoverRadius);
+            } else {
+                QPainterPath clip;
+                clip.addRoundedRect(QRectF(box), kLibraryCoverRadius, kLibraryCoverRadius);
+                painter->setClipPath(clip);
+                painter->drawPixmap(box, opt.icon.pixmap(side, side));
+                painter->setClipping(false);
+            }
+            textRect.setLeft(box.right() + 8);
         }
         painter->setPen(QColor(QStringLiteral("#f3efe6")));
         painter->setFont(opt.font);
         painter->drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
                           opt.fontMetrics.elidedText(opt.text, Qt::ElideRight, textRect.width()));
         painter->restore();
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        if (index.data(PlaylistModel::HeaderRole).toBool())
+            return QSize(120, 26);
+        QSize size = QStyledItemDelegate::sizeHint(option, index);
+        size.setHeight(std::max(size.height(), kLibraryCoverRow));
+        return size;
     }
 };
 
@@ -460,6 +512,73 @@ QString controlTitle(const QString &id)
     return id;
 }
 
+QString trackColumnKey(int column)
+{
+    switch (column) {
+    case TrackTableModel::ColCover: return QStringLiteral("col_cover");
+    case TrackTableModel::ColTitle: return QStringLiteral("col_title");
+    case TrackTableModel::ColArtistAlbum: return QStringLiteral("col_artist");
+    case TrackTableModel::ColDuration: return QStringLiteral("col_duration");
+    }
+    return {};
+}
+
+// After the editor has its real size hint, keep the window on the screen that
+// holds the main window. A font combo or a full-size canvas can be wider than
+// that screen; scrolling the content avoids parking the frame at a huge x.
+void placeEditorDialog(QDialog &dialog, QWidget *content, QWidget *anchor)
+{
+    QWidget *host = anchor ? anchor->window() : nullptr;
+    QScreen *screen = nullptr;
+    if (host && host->windowHandle())
+        screen = host->windowHandle()->screen();
+    if (!screen && host)
+        screen = QGuiApplication::screenAt(host->frameGeometry().center());
+    if (!screen)
+        screen = QGuiApplication::primaryScreen();
+    const QRect avail = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
+
+    if (content->layout()) content->layout()->activate();
+    content->ensurePolished();
+    content->adjustSize();
+    QSize hint = content->sizeHint().expandedTo(content->minimumSize());
+    hint = hint.expandedTo(QSize(320, 180));
+    content->resize(hint);
+
+    // Client size, with room left for the title bar and the window borders.
+    const int maxW = std::max(320, avail.width() - 32);
+    const int maxH = std::max(180, avail.height() - 72);
+    const bool overflow = hint.width() > maxW || hint.height() > maxH;
+
+    auto *outer = new QVBoxLayout(&dialog);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->setSizeConstraint(QLayout::SetNoConstraint);
+    if (overflow) {
+        auto *scroll = new QScrollArea;
+        scroll->setWidgetResizable(false);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        scroll->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        scroll->setWidget(content);
+        outer->addWidget(scroll);
+    } else {
+        outer->addWidget(content);
+    }
+
+    const QSize fitted(std::min(hint.width(), maxW), std::min(hint.height(), maxH));
+    dialog.setFixedSize(fitted);
+
+    const QRect basis = (host && host->isVisible()) ? host->frameGeometry() : avail;
+    int x = basis.center().x() - fitted.width() / 2;
+    int y = basis.center().y() - fitted.height() / 2;
+    x = std::clamp(x, avail.left(), std::max(avail.left(), avail.right() - fitted.width() + 1));
+    y = std::clamp(y, avail.top(), std::max(avail.top(), avail.bottom() - fitted.height() + 1));
+    if (y < avail.top()) y = avail.top();
+    dialog.move(x, y);
+}
+
 } // namespace
 
 MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library,
@@ -481,7 +600,7 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     auto *playlistView = new PlaylistDropView;
     m_playlistView = playlistView;
     m_playlistView->setModel(&m_playlistModel);
-    m_playlistView->setIconSize(QSize(28, 28));
+    m_playlistView->setIconSize(QSize(56, 56));
     m_playlistView->setSpacing(2);
     m_playlistView->setAcceptDrops(true);
     m_playlistView->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -493,8 +612,8 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     railLayout->addWidget(importButton);
     railLayout->addWidget(libraryButton);
     railLayout->addWidget(new QLabel(tr("Плейлисты")));
-    railLayout->addWidget(m_playlistView, 1);
     railLayout->addWidget(newPlaylistButton);
+    railLayout->addWidget(m_playlistView, 1);
     auto *rail = new QWidget;
     rail->setLayout(railLayout);
 
@@ -527,12 +646,12 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     m_trackView->horizontalHeader()->setHighlightSections(false);
     m_trackView->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     m_trackView->horizontalHeader()->setStretchLastSection(false);
-    m_trackView->horizontalHeader()->setSectionResizeMode(TrackTableModel::ColCover, QHeaderView::Fixed);
-    m_trackView->horizontalHeader()->setSectionResizeMode(TrackTableModel::ColTitle, QHeaderView::Interactive);
-    m_trackView->horizontalHeader()->setSectionResizeMode(TrackTableModel::ColArtistAlbum, QHeaderView::Stretch);
-    m_trackView->horizontalHeader()->setSectionResizeMode(TrackTableModel::ColDuration, QHeaderView::Fixed);
+    m_trackView->horizontalHeader()->setMinimumSectionSize(1);
+    m_trackView->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    m_trackView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_trackView->setColumnWidth(TrackTableModel::ColCover, 76);
     m_trackView->setColumnWidth(TrackTableModel::ColTitle, 280);
+    m_trackView->setColumnWidth(TrackTableModel::ColArtistAlbum, 400);
     m_trackView->setColumnWidth(TrackTableModel::ColDuration, 84);
     QPalette selection = m_trackView->palette();
     selection.setColor(QPalette::Highlight, QColor(QStringLiteral("#3a3428")));
@@ -591,9 +710,18 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     m_canvas->registerFractionalItem(miniNext, {0.515, 0.14});
     m_canvas->registerFractionalItem(m_seekItem, {0.01, 0.62});
 
+    auto *sleepButton = new QToolButton;
+    sleepButton->setObjectName(QStringLiteral("sleepTimer"));
+    sleepButton->setText(tr("Таймер"));
+    sleepButton->setCursor(Qt::PointingHandCursor);
+    sleepButton->setFocusPolicy(Qt::NoFocus);
+    sleepButton->setMinimumWidth(104);
+    m_sleepButton = sleepButton;
+
     auto *miniLayout = new QHBoxLayout;
     miniLayout->setContentsMargins(8, 4, 8, 4);
     miniLayout->addWidget(m_canvas, 1);
+    miniLayout->addWidget(sleepButton, 0, Qt::AlignVCenter);
     auto *miniBar = new QWidget;
     miniBar->setObjectName(QStringLiteral("miniBar"));
     miniBar->setLayout(miniLayout);
@@ -683,6 +811,7 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     connect(m_panel, &PlayerPanel::shuffleToggled, this, [this](bool on) {
         m_queue.setShuffle(on);
         m_db.setSetting(QStringLiteral("shuffle"), on ? QStringLiteral("1") : QStringLiteral("0"));
+        armUpcoming();
     });
     connect(m_panel, &PlayerPanel::repeatClicked, this, &MainWindow::cycleRepeatMode);
     connect(m_panel, &PlayerPanel::queueActivated, this, [this](int row) {
@@ -707,10 +836,28 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
         m_db.setSetting(QStringLiteral("queue_ratio"), QString::number(ratio, 'f', 3));
     });
     connect(logoButton, &QToolButton::clicked, this, &MainWindow::openSettings);
+    connect(m_sleepButton, &QToolButton::clicked, this, [this]() { openSleepMenu(m_sleepButton); });
+    connect(m_panel->sleepButton(), &QToolButton::clicked, this, [this]() { openSleepMenu(m_panel->sleepButton()); });
+    m_gapTimer.setSingleShot(true);
+    connect(&m_gapTimer, &QTimer::timeout, this, &MainWindow::onTrackGapElapsed);
+    m_sleepTicker.setInterval(1000);
+    connect(&m_sleepTicker, &QTimer::timeout, this, &MainWindow::onSleepTick);
     connect(m_trackView->horizontalHeader(), &QHeaderView::sectionResized, this,
-            [this](int section, int, int newSize) {
-                if (section == TrackTableModel::ColTitle && newSize >= 80)
-                    m_db.setSetting(QStringLiteral("col_title"), QString::number(newSize));
+            [this](int section, int oldSize, int newSize) {
+                if (m_fittingColumns || oldSize == newSize || !m_trackView) return;
+                if ((QApplication::mouseButtons() & Qt::LeftButton) == 0) return;
+                m_userColumnDrag = true;
+                QHeaderView *header = m_trackView->horizontalHeader();
+                const int count = TrackTableModel::ColCount;
+                // The handle is the right edge of this section. Only the next
+                // column absorbs the delta, so the edge under the cursor stays put.
+                if (section < 0 || section + 1 >= count) return;
+                const int neighbor = section + 1;
+                const int neighborWidth = std::max(1, header->sectionSize(neighbor) - (newSize - oldSize));
+                if (header->sectionSize(neighbor) == neighborWidth) return;
+                m_fittingColumns = true;
+                header->resizeSection(neighbor, neighborWidth);
+                m_fittingColumns = false;
             });
     new SmoothScroller(m_trackView);
     new SmoothScroller(m_playlistView);
@@ -721,6 +868,7 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     connect(&m_queue, &PlaybackQueue::currentChanged, this, &MainWindow::onQueueCurrentChanged);
     connect(&m_queue, &PlaybackQueue::queueChanged, this, [this]() {
         m_panel->setQueue(m_queue.tracks(), m_queue.currentIndex());
+        armUpcoming();
     });
     connect(&m_audio, &AudioEngine::positionChanged, this, &MainWindow::onAudioPositionChanged);
     connect(&m_audio, &AudioEngine::trackFinished, this, &MainWindow::onAudioTrackFinished);
@@ -748,6 +896,17 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     m_queue.setShuffle(shuffle);
     m_panel->setShuffle(shuffle);
 
+    m_gapless = m_db.getSetting(QStringLiteral("gapless"), QStringLiteral("0")) == QLatin1String("1");
+    m_audio.setGapless(m_gapless);
+    {
+        QString gapText = m_db.getSetting(QStringLiteral("track_gap"), QStringLiteral("0")).trimmed();
+        gapText.replace(QLatin1Char(','), QLatin1Char('.'));
+        bool gapOk = false;
+        const double gapSeconds = gapText.toDouble(&gapOk);
+        const double clamped = gapOk ? std::clamp(gapSeconds, 0.0, 10.0) : 0.0;
+        m_trackGapSec = std::round(clamped * 100.0) / 100.0;
+    }
+
     int repeat = m_db.getSetting(QStringLiteral("repeat"), QStringLiteral("0")).toInt();
     if (repeat < 0 || repeat > 2) repeat = 0;
     const auto repeatMode = static_cast<PlaybackQueue::RepeatMode>(repeat);
@@ -759,15 +918,23 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
         QFontDatabase::addApplicationFont(fontFile);
     m_uiFontFamily = m_db.getSetting(QStringLiteral("ui_font"));
     m_uiFontSize = std::clamp(m_db.getSetting(QStringLiteral("ui_font_size"), QStringLiteral("10")).toInt(), 9, 18);
-    m_buttonStyle = std::clamp(m_db.getSetting(QStringLiteral("ui_button_style"), QStringLiteral("0")).toInt(), 0, 2);
-    const int titleWidth = m_db.getSetting(QStringLiteral("col_title")).toInt();
-    if (titleWidth >= 140) m_trackView->setColumnWidth(TrackTableModel::ColTitle, titleWidth);
+    {
+        int buttonStyle = m_db.getSetting(QStringLiteral("ui_button_style"), QStringLiteral("0")).toInt();
+        if (buttonStyle == 2) {
+            buttonStyle = 0;
+            m_db.setSetting(QStringLiteral("ui_button_style"), QStringLiteral("0"));
+        }
+        m_buttonStyle = buttonStyle == 1 ? 1 : 0;
+    }
+    restoreColumnWeights();
+    QTimer::singleShot(0, this, [this]() { applyColumnRatios(); });
 
     QColor accent(m_db.getSetting(QStringLiteral("accent"), QStringLiteral("#c9974b")));
     if (!accent.isValid()) accent = QColor(QStringLiteral("#c9974b"));
     applyAccent(accent);
 
     loadOrCreateDefaultSkin();
+    syncLibraryCoverShape();
     refreshTracks();
     refreshPlaylists();
     adoptFirstTrackCovers();
@@ -778,6 +945,14 @@ MainWindow::MainWindow(Database &db, AudioEngine &audio, LibraryManager &library
     m_fetcher.enqueueMissing();
     connect(&m_library, &LibraryManager::libraryFoldersChanged, this, &MainWindow::onLibraryFoldersChanged);
     m_library.startWatching();
+
+    m_updates = new UpdateChecker(this);
+    connect(m_updates, &UpdateChecker::checkFinished, this, [this](const UpdateStatus &) {
+        onUpdateChecked();
+    });
+    QTimer::singleShot(0, this, [this]() {
+        if (m_updates) m_updates->start();
+    });
 }
 
 void MainWindow::presentTracks(const QVector<Track> &tracks, int libraryTotal, bool keepScroll)
@@ -827,7 +1002,136 @@ void MainWindow::refreshTracks(const QString &search, bool keepScroll)
 
 void MainWindow::refreshPlaylists()
 {
+    const qint64 keep = m_activePlaylistId;
     m_playlistModel.setPlaylists(m_db.allPlaylists());
+    if (keep < 0 || !m_playlistView) return;
+    for (int row = 0; row < m_playlistModel.rowCount(); ++row) {
+        if (m_playlistModel.idAt(row) != keep) continue;
+        m_playlistView->setCurrentIndex(m_playlistModel.index(row));
+        break;
+    }
+}
+
+void MainWindow::armUpcoming()
+{
+    if (!m_gapless || m_stopAfterTrack) {
+        m_audio.clearNext();
+        return;
+    }
+    const auto current = m_queue.current();
+    if (!current || m_audio.loadedPath() != current->path)
+        return;
+    if (const auto next = m_queue.upcoming())
+        m_audio.prepareNext(next->path);
+    else
+        m_audio.clearNext();
+}
+
+void MainWindow::refreshSleepControls()
+{
+    QString text = tr("Таймер");
+    bool running = false;
+    if (m_stopAfterTrack) {
+        text = tr("Конец трека");
+        running = true;
+    } else if (m_sleepEndsAtMs > 0) {
+        const qint64 left = std::max<qint64>(0, m_sleepEndsAtMs - QDateTime::currentMSecsSinceEpoch());
+        const int total = int((left + 999) / 1000);
+        text = tr("Таймер %1:%2").arg(total / 60).arg(total % 60, 2, 10, QChar('0'));
+        running = true;
+    }
+    const auto apply = [&](QToolButton *button) {
+        if (!button) return;
+        button->setText(text);
+        button->setProperty("running", running);
+        button->style()->unpolish(button);
+        button->style()->polish(button);
+        button->update();
+    };
+    apply(m_sleepButton);
+    if (m_panel) apply(m_panel->sleepButton());
+}
+
+void MainWindow::openSleepMenu(QWidget *anchor)
+{
+    if (!anchor) return;
+    QMenu menu(this);
+    QAction *off = menu.addAction(tr("Выключить"));
+    off->setCheckable(true);
+    off->setChecked(!m_stopAfterTrack && m_sleepMinutes <= 0);
+
+    const int choices[] = {15, 30, 45, 60, 90};
+    QAction *minuteActions[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        minuteActions[i] = menu.addAction(tr("%1 минут").arg(choices[i]));
+        minuteActions[i]->setCheckable(true);
+        minuteActions[i]->setChecked(!m_stopAfterTrack && m_sleepMinutes == choices[i]);
+        minuteActions[i]->setData(choices[i]);
+    }
+    menu.addSeparator();
+    QAction *afterTrack = menu.addAction(tr("Остановить после этого трека"));
+    afterTrack->setCheckable(true);
+    afterTrack->setChecked(m_stopAfterTrack);
+
+    QAction *chosen = menu.exec(anchor->mapToGlobal(QPoint(0, anchor->height())));
+    if (!chosen) return;
+
+    if (chosen == off) {
+        m_stopAfterTrack = false;
+        m_sleepMinutes = 0;
+        m_sleepEndsAtMs = 0;
+        m_sleepTicker.stop();
+        armUpcoming();
+        refreshSleepControls();
+        return;
+    }
+    if (chosen == afterTrack) {
+        m_stopAfterTrack = true;
+        m_sleepMinutes = 0;
+        m_sleepEndsAtMs = 0;
+        m_sleepTicker.stop();
+        m_gapTimer.stop();
+        armUpcoming();
+        refreshSleepControls();
+        return;
+    }
+    const int minutes = chosen->data().toInt();
+    if (minutes <= 0) return;
+    m_stopAfterTrack = false;
+    m_sleepMinutes = minutes;
+    m_sleepEndsAtMs = QDateTime::currentMSecsSinceEpoch() + qint64(minutes) * 60 * 1000;
+    if (!m_sleepTicker.isActive()) m_sleepTicker.start();
+    armUpcoming();
+    refreshSleepControls();
+}
+
+void MainWindow::onTrackGapElapsed()
+{
+    if (m_stopAfterTrack) return;
+    if (!m_queue.advance()) {
+        m_playPauseItem->setPlaying(false);
+        m_panel->setPlaying(false);
+        m_coverItem->setPlaybackActive(false);
+    }
+}
+
+void MainWindow::onSleepTick()
+{
+    if (m_sleepEndsAtMs <= 0) {
+        m_sleepTicker.stop();
+        refreshSleepControls();
+        return;
+    }
+    if (QDateTime::currentMSecsSinceEpoch() >= m_sleepEndsAtMs) {
+        m_sleepEndsAtMs = 0;
+        m_sleepMinutes = 0;
+        m_sleepTicker.stop();
+        m_gapTimer.stop();
+        m_audio.pause();
+        refreshSleepControls();
+        return;
+    }
+    refreshSleepControls();
 }
 
 void MainWindow::showLibrary()
@@ -944,6 +1248,117 @@ void MainWindow::setPlayerOpen(bool open)
     anim->start(QAbstractAnimation::DeleteWhenStopped);
 }
 
+void MainWindow::restoreColumnWeights()
+{
+    const int defaults[TrackTableModel::ColCount] = {76, 280, 400, 84};
+    int saved[TrackTableModel::ColCount];
+    bool complete = true;
+    for (int column = 0; column < TrackTableModel::ColCount; ++column) {
+        saved[column] = m_db.getSetting(trackColumnKey(column)).toInt();
+        if (saved[column] < 1) complete = false;
+    }
+    if (complete) {
+        for (int column = 0; column < TrackTableModel::ColCount; ++column)
+            m_columnWeights[column] = saved[column];
+        m_columnPreferenceSaved = true;
+        return;
+    }
+    m_columnPreferenceSaved = false;
+    for (int column = 0; column < TrackTableModel::ColCount; ++column)
+        m_columnWeights[column] = defaults[column];
+    if (saved[TrackTableModel::ColTitle] >= 140)
+        m_columnWeights[TrackTableModel::ColTitle] = saved[TrackTableModel::ColTitle];
+}
+
+bool MainWindow::rememberColumnRatios()
+{
+    if (!m_trackView || m_fittingColumns) return false;
+    QHeaderView *header = m_trackView->horizontalHeader();
+    if (!header || header->count() < TrackTableModel::ColCount) return false;
+    int weights[TrackTableModel::ColCount];
+    for (int column = 0; column < TrackTableModel::ColCount; ++column) {
+        weights[column] = header->sectionSize(column);
+        if (weights[column] < 1) return false;
+    }
+    for (int column = 0; column < TrackTableModel::ColCount; ++column) {
+        m_columnWeights[column] = weights[column];
+        m_db.setSetting(trackColumnKey(column), QString::number(weights[column]));
+    }
+    m_columnPreferenceSaved = true;
+    return true;
+}
+
+void MainWindow::applyColumnRatios()
+{
+    if (!m_trackView || m_userColumnDrag || m_fittingColumns) return;
+    QHeaderView *header = m_trackView->horizontalHeader();
+    if (!header || header->count() < TrackTableModel::ColCount) return;
+    const int count = TrackTableModel::ColCount;
+    const int available = m_trackView->viewport()->width();
+    if (available < count) return;
+
+    m_fittingColumns = true;
+    if (!m_columnPreferenceSaved) {
+        const int cover = std::clamp(m_columnWeights[TrackTableModel::ColCover], 1, available - (count - 1));
+        header->resizeSection(TrackTableModel::ColCover, cover);
+        const int restAvailable = std::max(count - 1, available - header->sectionSize(TrackTableModel::ColCover));
+        int restSum = 0;
+        for (int column = 1; column < count; ++column)
+            restSum += std::max(1, m_columnWeights[column]);
+        int used = 0;
+        for (int column = 1; column < count; ++column) {
+            int width;
+            if (column == count - 1) {
+                width = std::max(1, restAvailable - used);
+            } else {
+                width = int((qint64(restAvailable) * std::max(1, m_columnWeights[column])) / restSum);
+                const int maxWidth = restAvailable - used - (count - column - 1);
+                width = std::clamp(width, 1, std::max(1, maxWidth));
+            }
+            header->resizeSection(column, width);
+            used += header->sectionSize(column);
+        }
+    } else {
+        int sum = 0;
+        for (int column = 0; column < count; ++column) {
+            if (m_columnWeights[column] < 1) m_columnWeights[column] = 1;
+            sum += m_columnWeights[column];
+        }
+        int used = 0;
+        for (int column = 0; column < count; ++column) {
+            int width;
+            if (column == count - 1) {
+                width = std::max(1, available - used);
+            } else {
+                width = int((qint64(available) * m_columnWeights[column]) / sum);
+                const int maxWidth = available - used - (count - column - 1);
+                width = std::clamp(width, 1, std::max(1, maxWidth));
+            }
+            header->resizeSection(column, width);
+            used += header->sectionSize(column);
+        }
+    }
+    const int overflow = header->length() - available;
+    if (overflow > 0)
+        header->resizeSection(count - 1, std::max(1, header->sectionSize(count - 1) - overflow));
+    if (header->offset() != 0)
+        header->setOffset(0);
+    m_fittingColumns = false;
+}
+
+void MainWindow::syncLibraryCoverShape()
+{
+    if (!m_trackView || !m_panel) return;
+    QString shape = m_panel->coverShapeId();
+    if (shape != QLatin1String("square") && shape != QLatin1String("vinyl"))
+        shape = QStringLiteral("rounded");
+    m_trackView->setProperty("coverShape", shape);
+    if (QWidget *viewport = m_trackView->viewport()) {
+        viewport->setProperty("coverShape", shape);
+        viewport->update();
+    }
+}
+
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
@@ -990,6 +1405,16 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         m_db.setSetting(QStringLiteral("library_split"), QString::number(m_librarySplit->sizes().value(0)));
         return true;
     }
+    if (m_userColumnDrag && event->type() == QEvent::MouseButtonRelease
+        && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+        QTimer::singleShot(0, this, [this]() {
+            if (!m_userColumnDrag) return;
+            m_userColumnDrag = false;
+            if (rememberColumnRatios()) applyColumnRatios();
+        });
+    }
+    if (m_trackView && watched == m_trackView->viewport() && event->type() == QEvent::Resize)
+        applyColumnRatios();
     if (event->type() == QEvent::KeyPress && handlePlayerKey(static_cast<QKeyEvent *>(event)))
         return true;
     return QMainWindow::eventFilter(watched, event);
@@ -1065,6 +1490,10 @@ void MainWindow::applyAccent(const QColor &color)
 {
     m_accent = color;
     if (m_canvas) m_canvas->applyAccent(color);
+    if (m_playPauseItem && color.isValid()) {
+        m_playPauseItem->clearSkinColor();
+        m_playPauseItem->setAccent(color);
+    }
     if (m_panel) m_panel->setAccent(color);
     applyWindowChrome();
 }
@@ -1079,10 +1508,6 @@ void MainWindow::applyWindowChrome()
         buttons = QStringLiteral(
             "QPushButton { background: %1; color: #14161c; border: none; border-radius: 6px; padding: 6px 10px; }"
             "QPushButton:hover { background: %1; }").arg(accent);
-    } else if (m_buttonStyle == 2) {
-        buttons = QStringLiteral(
-            "QPushButton { background: transparent; color: #ece8e0; border: none; border-radius: 6px; padding: 6px 10px; }"
-            "QPushButton:hover { color: %1; }").arg(accent);
     } else {
         buttons = QStringLiteral(
             "QPushButton { background: #242833; color: #ece8e0; border: 1px solid %1; border-radius: 6px; padding: 6px 10px; }"
@@ -1111,10 +1536,10 @@ void MainWindow::applyWindowChrome()
         QStatusBar { color: #8b8a86; }
         #playerPanel, #playerLogo, #playerGutter, #playerTop { background: #181b22; border: none; }
         #playerPanel QSplitter, #playerQueue { background: transparent; border: none; }
-        #queueCard { background: #2a3142; border: none; border-radius: 18px; }
-        #queueCard[photo="true"] { background: rgba(42, 49, 66, 170); }
+        #queueCard { background: transparent; border: none; border-radius: 18px; }
         #queueCard QListView, #queueCard QListView::viewport, #queueCard QLabel {
             background: transparent; border: none; border-radius: 0px;
+            color: #f3efe6;
         }
         #logoStrip { background: #14161c; border: none; }
         #appLogo { background: transparent; border: none; border-radius: 12px; }
@@ -1122,7 +1547,11 @@ void MainWindow::applyWindowChrome()
         #tourCard { background: #242833; border: 1px solid #c9974b; border-radius: 12px; }
         #tourCard QLabel { color: #f3efe6; background: transparent; }
         #miniBar { background: #1b1e27; border-top: 1px solid #2a2e3a; }
-    )")).replace(QStringLiteral("#3a3428"), selection) + buttons);
+    )")).replace(QStringLiteral("#3a3428"), selection) + buttons + QStringLiteral(
+        "QToolButton#sleepTimer { color: #ece8e0; background: #242833; border: 1px solid #2a2e3a; "
+        "border-radius: 8px; padding: 4px 10px; }"
+        "QToolButton#sleepTimer:hover { background: #2e3340; }"
+        "QToolButton#sleepTimer[running=\"true\"] { color: %1; border-color: %1; }").arg(accent));
 
     const auto paintSelection = [](QAbstractItemView *view) {
         if (!view) return;
@@ -1137,6 +1566,16 @@ void MainWindow::applyWindowChrome()
     paintSelection(m_playlistView);
     if (m_panel) paintSelection(m_panel->queueView());
 
+    const auto styleTransport = [this](SkinCanvas *canvas) {
+        if (!canvas) return;
+        for (DraggableItem *item : canvas->items()) {
+            if (auto *button = dynamic_cast<TextButtonItem *>(item))
+                button->setButtonStyle(m_buttonStyle == 1 ? 1 : 0);
+        }
+    };
+    styleTransport(m_canvas);
+    if (m_panel) styleTransport(m_panel->canvas());
+
     if (!m_librarySplit) return;
     QFont font = m_librarySplit->font();
     if (!m_uiFontFamily.isEmpty()) font.setFamily(m_uiFontFamily);
@@ -1144,14 +1583,23 @@ void MainWindow::applyWindowChrome()
     const auto widgets = m_librarySplit->findChildren<QWidget *>();
     m_librarySplit->setFont(font);
     for (QWidget *widget : widgets) widget->setFont(font);
+    refreshSleepControls();
 }
 
 void MainWindow::openSettings()
 {
-    enum class FollowUp { None, Editor, Window, Equalizer, Tour };
+    enum class FollowUp { None, Editor, Window, Tour };
     FollowUp follow = FollowUp::None;
+    // Keep the startup notice out of this function. A second modal exec while
+    // SettingsDialog is open freezes the process on Windows. The equalizer is
+    // shown with show() from this loop and is not started after the dialog closes.
+    m_deferUpdateNotice = true;
     {
-        SettingsDialog dialog(m_audio.sampleRate(), m_audio.bitDepth(), libraryRootPath(), this);
+        const UpdateStatus update = m_updates ? m_updates->status() : UpdateStatus{};
+        SettingsDialog dialog(m_audio.sampleRate(), m_audio.bitDepth(), m_gapless, m_trackGapSec,
+                              libraryRootPath(), update, this);
+        if (m_updates)
+            connect(m_updates, &UpdateChecker::checkFinished, &dialog, &SettingsDialog::setUpdateStatus);
         connect(&dialog, &SettingsDialog::editPlayerRequested, this, [&]() {
             follow = FollowUp::Editor;
             dialog.accept();
@@ -1166,9 +1614,8 @@ void MainWindow::openSettings()
             applyAccent(picked);
             m_db.setSetting(QStringLiteral("accent"), picked.name(QColor::HexRgb));
         });
-        connect(&dialog, &SettingsDialog::equalizerRequested, this, [&]() {
-            follow = FollowUp::Equalizer;
-            dialog.accept();
+        connect(&dialog, &SettingsDialog::equalizerRequested, this, [this, &dialog]() {
+            openEqualizer(&dialog);
         });
         connect(&dialog, &SettingsDialog::outputChanged, this, [this, &dialog](int sampleRate, int bitDepth) {
             const int previousRate = m_audio.sampleRate();
@@ -1177,10 +1624,28 @@ void MainWindow::openSettings()
                 dialog.setOutput(previousRate, previousDepth);
                 QMessageBox::warning(this, tr("Звучание"),
                                      tr("Устройство не приняло этот формат. Оставлен прежний вывод."));
+                armUpcoming();
                 return;
             }
             m_db.setSetting(QStringLiteral("sample_rate"), QString::number(m_audio.sampleRate()));
             m_db.setSetting(QStringLiteral("bit_depth"), QString::number(m_audio.bitDepth()));
+            armUpcoming();
+        });
+        connect(&dialog, &SettingsDialog::gaplessChanged, this, [this](bool on) {
+            m_gapless = on;
+            m_db.setSetting(QStringLiteral("gapless"), on ? QStringLiteral("1") : QStringLiteral("0"));
+            m_audio.setGapless(on);
+            if (on && m_gapTimer.isActive()) {
+                m_gapTimer.stop();
+                onTrackGapElapsed();
+            } else {
+                armUpcoming();
+            }
+        });
+        connect(&dialog, &SettingsDialog::trackGapChanged, this, [this](double seconds) {
+            const double clamped = std::clamp(seconds, 0.0, 10.0);
+            m_trackGapSec = std::round(clamped * 100.0) / 100.0;
+            m_db.setSetting(QStringLiteral("track_gap"), QString::number(m_trackGapSec, 'f', 2));
         });
         connect(&dialog, &SettingsDialog::libraryChangeRequested, this, [this, &dialog]() {
             if (chooseLibraryDirectory()) dialog.setLibraryPath(libraryRootPath());
@@ -1193,8 +1658,191 @@ void MainWindow::openSettings()
     }
     if (follow == FollowUp::Editor) openPlayerEditor();
     else if (follow == FollowUp::Window) openWindowEditor();
-    else if (follow == FollowUp::Equalizer) openEqualizer();
     else if (follow == FollowUp::Tour) startTour();
+    m_deferUpdateNotice = false;
+    if (m_updateDownloadPending) {
+        m_updateDownloadPending = false;
+        m_updateNoticePending = false;
+        startUpdateDownload();
+    } else if (m_updateNoticePending) {
+        showUpdateNotice();
+    }
+}
+
+void MainWindow::onUpdateChecked()
+{
+    if (!m_updates) return;
+    if (m_updates->status().state != UpdateStatus::State::UpdateAvailable || m_updateNoticeShown)
+        return;
+    if (m_deferUpdateNotice) {
+        m_updateNoticePending = true;
+        return;
+    }
+    showUpdateNotice();
+}
+
+void MainWindow::showUpdateNotice()
+{
+    if (m_deferUpdateNotice || m_updateNoticeShown || !m_updates || !isVisible()) return;
+    const UpdateStatus status = m_updates->status();
+    if (status.state != UpdateStatus::State::UpdateAvailable) {
+        m_updateNoticePending = false;
+        return;
+    }
+    m_updateNoticeShown = true;
+    m_updateNoticePending = false;
+
+    QString version = status.latestTag.trimmed();
+    if (version.size() > 1
+        && (version.at(0) == QLatin1Char('v') || version.at(0) == QLatin1Char('V')))
+        version.remove(0, 1);
+    if (version.isEmpty())
+        version = status.latestTag;
+
+    // Non-modal on purpose: a second modal exec while SettingsDialog is open
+    // freezes the process. This window is shown only after that dialog closes.
+    auto *dialog = new QDialog(this);
+    dialog->setWindowTitle(tr("Обновление"));
+    dialog->setModal(false);
+    dialog->setWindowModality(Qt::NonModal);
+    dialog->setMinimumWidth(420);
+    auto *layout = new QVBoxLayout(dialog);
+    layout->setSpacing(12);
+    auto *text = new QLabel(tr("Доступна новая версия %1").arg(version));
+    text->setWordWrap(true);
+    text->setStyleSheet(QStringLiteral("color: #ece8e0; background: transparent; border: none;"));
+    layout->addWidget(text);
+    auto *row = new QHBoxLayout;
+    row->addStretch(1);
+    auto *stay = new QPushButton(tr("Остаться на этой"));
+    auto *update = new QPushButton(tr("Обновить"));
+    stay->setCursor(Qt::PointingHandCursor);
+    update->setCursor(Qt::PointingHandCursor);
+    update->setDefault(true);
+    update->setAutoDefault(true);
+    stay->setAutoDefault(false);
+    row->addWidget(stay);
+    row->addWidget(update);
+    layout->addLayout(row);
+
+    connect(stay, &QPushButton::clicked, dialog, &QDialog::close);
+    connect(update, &QPushButton::clicked, dialog, [dialog]() {
+        dialog->setProperty("sandplayUpdate", true);
+        dialog->close();
+    });
+    connect(dialog, &QDialog::finished, this, [this, dialog](int) {
+        const bool updateNow = dialog->property("sandplayUpdate").toBool();
+        dialog->deleteLater();
+        if (updateNow)
+            startUpdateDownload();
+    });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+void MainWindow::startUpdateDownload()
+{
+    if (!m_updates)
+        return;
+    // SettingsDialog::exec is still on the stack. A modal progress box here freezes the app.
+    if (m_deferUpdateNotice) {
+        m_updateDownloadPending = true;
+        return;
+    }
+
+    const UpdateStatus status = m_updates->status();
+    if (status.state != UpdateStatus::State::UpdateAvailable)
+        return;
+    if (status.assetKind == UpdateStatus::AssetKind::None) {
+        QMessageBox::information(this, tr("Обновление"),
+                                 tr("В этом выпуске нет файла для обновления."));
+        return;
+    }
+
+    QProgressDialog progress(tr("Загрузка обновления…"), tr("Отмена"), 0, 0, this);
+    progress.setWindowTitle(tr("Обновление"));
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumWidth(420);
+
+    bool canceled = false;
+    bool failed = false;
+    QString error;
+    QString savedPath;
+    bool installer = false;
+
+    connect(m_updates, &UpdateChecker::downloadProgress, &progress,
+            [&progress](qint64 received, qint64 total) {
+        if (total <= 0) {
+            progress.setMaximum(0);
+            return;
+        }
+        progress.setMaximum(100);
+        const int percent = static_cast<int>(std::clamp(received * 100 / total, qint64(0), qint64(100)));
+        progress.setValue(percent);
+    });
+    connect(m_updates, &UpdateChecker::downloadFinished, &progress,
+            [&](const QString &path, bool isInstaller) {
+        savedPath = path;
+        installer = isInstaller;
+        progress.accept();
+    });
+    connect(m_updates, &UpdateChecker::downloadFailed, &progress, [&](const QString &message) {
+        failed = true;
+        error = message;
+        progress.reject();
+    });
+    connect(m_updates, &UpdateChecker::downloadCanceled, &progress, [&]() {
+        canceled = true;
+        progress.reject();
+    });
+    connect(&progress, &QProgressDialog::canceled, this, [this, &canceled]() {
+        canceled = true;
+        if (m_updates)
+            m_updates->cancelDownload();
+    });
+
+    m_updates->downloadUpdate();
+    if (savedPath.isEmpty() && !failed && !canceled)
+        progress.exec();
+
+    disconnect(m_updates, nullptr, &progress, nullptr);
+    disconnect(&progress, nullptr, this, nullptr);
+
+    if (canceled || progress.wasCanceled())
+        return;
+
+    if (failed || savedPath.isEmpty()) {
+        if (error.isEmpty())
+            error = tr("Не удалось скачать обновление.");
+        QMessageBox::warning(this, tr("Обновление"), error);
+        m_updateNoticeShown = false;
+        showUpdateNotice();
+        return;
+    }
+
+    if (installer) {
+        const QFileInfo info(savedPath);
+        if (!QProcess::startDetached(info.absoluteFilePath(), {}, info.absolutePath())) {
+            QMessageBox::warning(this, tr("Обновление"), tr("Не удалось запустить установку."));
+            m_updateNoticeShown = false;
+            showUpdateNotice();
+        }
+        return;
+    }
+
+    const QString folder = QFileInfo(savedPath).absolutePath();
+    QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+    const QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    const bool inDownloads = !downloads.isEmpty()
+        && QDir(folder).absolutePath().compare(QDir(downloads).absolutePath(), Qt::CaseInsensitive) == 0;
+    QMessageBox::information(this, tr("Обновление"),
+        inDownloads
+            ? tr("Архив сохранён в папку «Загрузки». Распакуйте его и запустите SandPlay.exe.")
+            : tr("Архив сохранён. Распакуйте его и запустите SandPlay.exe."));
 }
 
 bool MainWindow::adoptFontFile(const QString &path)
@@ -1232,7 +1880,8 @@ void MainWindow::openWindowEditor()
 
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Редактировать окно"));
-    auto *root = new QVBoxLayout(&dialog);
+    auto *content = new QWidget;
+    auto *root = new QVBoxLayout(content);
     auto *hint = new QLabel(tr("Тяните границу колонок и заголовки таблицы — размер меняется сразу."));
     hint->setWordWrap(true);
     root->addWidget(hint);
@@ -1241,8 +1890,8 @@ void MainWindow::openWindowEditor()
     auto *styleBox = new QComboBox;
     styleBox->addItem(tr("Кнопки: контур"), 0);
     styleBox->addItem(tr("Кнопки: заливка"), 1);
-    styleBox->addItem(tr("Кнопки: без рамки"), 2);
-    styleBox->setCurrentIndex(std::clamp(m_buttonStyle, 0, 2));
+    const int styleIndex = styleBox->findData(m_buttonStyle == 1 ? 1 : 0);
+    styleBox->setCurrentIndex(styleIndex >= 0 ? styleIndex : 0);
     auto *sizeBox = new QComboBox;
     for (int size = 9; size <= 18; ++size)
         sizeBox->addItem(tr("Размер %1").arg(size), size);
@@ -1277,7 +1926,7 @@ void MainWindow::openWindowEditor()
         applyWindowChrome();
     });
     connect(styleBox, &QComboBox::currentIndexChanged, this, [this, styleBox]() {
-        m_buttonStyle = styleBox->currentData().toInt();
+        m_buttonStyle = styleBox->currentData().toInt() == 1 ? 1 : 0;
         m_db.setSetting(QStringLiteral("ui_button_style"), QString::number(m_buttonStyle));
         applyWindowChrome();
     });
@@ -1290,7 +1939,6 @@ void MainWindow::openWindowEditor()
     auto *done = new QPushButton(tr("Готово"));
     connect(done, &QPushButton::clicked, &dialog, &QDialog::accept);
     root->addWidget(done, 0, Qt::AlignRight);
-    dialog.adjustSize();
 
     const auto putBack = [&]() {
         m_librarySplit->setParent(nullptr);
@@ -1304,6 +1952,7 @@ void MainWindow::openWindowEditor()
         ~Restore() { if (fn) fn(); }
     } restore{putBack};
 
+    placeEditorDialog(dialog, content, this);
     dialog.exec();
     restore.fn();
     restore.fn = nullptr;
@@ -1517,10 +2166,11 @@ void MainWindow::openPlayerEditor()
 
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Редактировать плеер"));
-    auto *root = new QVBoxLayout(&dialog);
+    auto *content = new QWidget;
+    auto *root = new QVBoxLayout(content);
     auto *hint = new QLabel(tr(
-        "Холст того же размера, что и в плеере. Потяните угол кнопки или обложки — размер меняется пропорционально. "
-        "Правый клик по кнопке ставит текстуру PNG, по обложке — форму и рамку, по пустому месту — фон."));
+        "Холст того же размера, что и в плеере. Потяните угол: обложка и воспроизведение сохраняют пропорции, "
+        "остальные кнопки тянутся свободно. Правый клик по кнопке ставит текстуру PNG, по обложке — форму и рамку, по пустому месту — фон."));
     hint->setWordWrap(true);
     hint->setMaximumWidth(std::max(tabSize.width(), miniSize.width()));
     root->addWidget(hint);
@@ -1537,7 +2187,6 @@ void MainWindow::openPlayerEditor()
     auto *done = new QPushButton(tr("Готово"));
     connect(done, &QPushButton::clicked, &dialog, &QDialog::accept);
     root->addWidget(done, 0, Qt::AlignRight);
-    dialog.adjustSize();
 
     const auto putCanvasesBack = [&]() {
         tab->setParent(nullptr);
@@ -1565,6 +2214,7 @@ void MainWindow::openPlayerEditor()
 
     m_panel->setEditMode(true);
     m_canvas->setEditMode(true);
+    placeEditorDialog(dialog, content, this);
     dialog.exec();
     restore.fn();
     restore.fn = nullptr;
@@ -1673,6 +2323,7 @@ void MainWindow::configureItem(DraggableItem *item)
         return;
     }
     if (item->scene() == m_panel->canvas()->scene()) mirrorTabLook();
+    syncLibraryCoverShape();
     onSkinLayoutChanged();
 }
 
@@ -1740,11 +2391,25 @@ void MainWindow::configureCanvas(SkinCanvas *canvas)
     onSkinLayoutChanged();
 }
 
-void MainWindow::openEqualizer()
+void MainWindow::openEqualizer(QWidget *parent)
 {
-    QDialog dialog(this);
-    dialog.setWindowTitle(tr("Эквалайзер"));
-    dialog.resize(560, 280);
+    QWidget *owner = parent ? parent : static_cast<QWidget *>(this);
+    if (QDialog *existing = owner->findChild<QDialog *>(QStringLiteral("equalizerDialog"), Qt::FindDirectChildrenOnly)) {
+        existing->show();
+        existing->raise();
+        existing->activateWindow();
+        return;
+    }
+
+    // show(), not exec() or open(). SettingsDialog::exec() is already running,
+    // and a nested modal loop freezes the process on Windows. This window is a
+    // child of settings, so closing settings deletes it; closing it leaves settings up.
+    auto *dialog = new QDialog(owner);
+    dialog->setObjectName(QStringLiteral("equalizerDialog"));
+    dialog->setModal(false);
+    dialog->setWindowModality(Qt::NonModal);
+    dialog->setWindowTitle(tr("Эквалайзер"));
+    dialog->resize(560, 280);
     auto *columns = new QHBoxLayout;
     QVector<QSlider *> sliders;
     for (int band = 0; band < AudioEngine::kEqBands; ++band) {
@@ -1769,13 +2434,15 @@ void MainWindow::openEqualizer()
         columns->addLayout(col);
     }
     auto *reset = new QPushButton(tr("Сбросить"));
-    connect(reset, &QPushButton::clicked, &dialog, [sliders]() {
+    connect(reset, &QPushButton::clicked, dialog, [sliders]() {
         for (QSlider *slider : sliders) slider->setValue(0);
     });
-    auto *root = new QVBoxLayout(&dialog);
+    auto *root = new QVBoxLayout(dialog);
     root->addLayout(columns);
     root->addWidget(reset, 0, Qt::AlignRight);
-    dialog.exec();
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 void MainWindow::cycleRepeatMode()
@@ -1789,6 +2456,7 @@ void MainWindow::cycleRepeatMode()
     m_queue.setRepeatMode(next);
     m_panel->setRepeatMode(next);
     m_db.setSetting(QStringLiteral("repeat"), QString::number(int(next)));
+    armUpcoming();
 }
 
 QVector<Track> MainWindow::selectedTracks() const
@@ -1834,6 +2502,7 @@ void MainWindow::addTracksToPlaylist(qint64 playlistId, const QList<qint64> &ids
         statusBar()->showMessage(tr("Эти треки уже есть в плейлисте"), 2500);
     else
         statusBar()->showMessage(tr("В плейлист добавлено: %1").arg(added), 2500);
+    if (added > 0) refreshPlaylists();
     adoptFirstTrackCovers();
 }
 
@@ -2037,11 +2706,30 @@ void MainWindow::onImportFolderClicked()
 
 void MainWindow::onNewPlaylistClicked()
 {
-    bool ok = false;
-    const QString name = QInputDialog::getText(this, tr("Новый плейлист"), tr("Название:"),
-                                                QLineEdit::Normal, {}, &ok);
-    if (!ok || name.trimmed().isEmpty()) return;
-    const qint64 id = m_db.createPlaylist(name.trimmed());
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Новый плейлист"));
+    dialog.setMinimumWidth(360);
+    auto *name = new QLineEdit;
+    auto *kind = new QComboBox;
+    kind->addItem(PlaylistModel::categoryLabel(0), 0);
+    kind->addItem(PlaylistModel::categoryLabel(3), 3);
+    kind->addItem(PlaylistModel::categoryLabel(2), 2);
+    kind->addItem(PlaylistModel::categoryLabel(1), 1);
+    auto *form = new QFormLayout;
+    form->addRow(tr("Название:"), name);
+    form->addRow(tr("Категория:"), kind);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Создать"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("Отмена"));
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setSpacing(12);
+    layout->addLayout(form);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    if (name->text().trimmed().isEmpty()) return;
+    const qint64 id = m_db.createPlaylist(name->text().trimmed(), kind->currentData().toInt());
     refreshPlaylists();
     for (int row = 0; row < m_playlistModel.rowCount(); ++row) {
         if (m_playlistModel.idAt(row) != id) continue;
@@ -2054,6 +2742,7 @@ void MainWindow::onNewPlaylistClicked()
 
 void MainWindow::onPlaylistSelected(const QModelIndex &index)
 {
+    if (!index.isValid() || m_playlistModel.isHeader(index.row())) return;
     m_activePlaylistId = m_playlistModel.idAt(index.row());
     if (m_activePlaylistId < 0) return;
     m_searchEdit->blockSignals(true);
@@ -2100,6 +2789,11 @@ void MainWindow::onSearchChanged(const QString &text)
 
 void MainWindow::onPlayPauseClicked()
 {
+    if (m_gapTimer.isActive()) {
+        m_gapTimer.stop();
+        onTrackGapElapsed();
+        return;
+    }
     if (!m_queue.current()) {
         if (!m_queue.tracks().isEmpty()) m_queue.jumpTo(0);
         return;
@@ -2115,6 +2809,7 @@ void MainWindow::onSeekRequested(qreal fraction01)
 
 void MainWindow::onQueueCurrentChanged(std::optional<Track> track)
 {
+    m_gapTimer.stop();
     m_panel->setQueue(m_queue.tracks(), m_queue.currentIndex());
     if (!track) {
         m_audio.stop();
@@ -2138,6 +2833,7 @@ void MainWindow::onQueueCurrentChanged(std::optional<Track> track)
     m_panel->setTrack(track);
     const QPixmap cover = track->coverPath.isEmpty() ? QPixmap{} : QPixmap(track->coverPath);
     m_coverItem->setPixmap(cover);
+    armUpcoming();
 }
 
 void MainWindow::onAudioPositionChanged(qint64 ms)
@@ -2151,6 +2847,25 @@ void MainWindow::onAudioPositionChanged(qint64 ms)
 
 void MainWindow::onAudioTrackFinished()
 {
+    if (m_stopAfterTrack) {
+        m_stopAfterTrack = false;
+        m_gapTimer.stop();
+        m_audio.clearNext();
+        m_audio.pause();
+        refreshSleepControls();
+        m_playPauseItem->setPlaying(false);
+        m_panel->setPlaying(false);
+        m_coverItem->setPlaybackActive(false);
+        return;
+    }
+    const int gapMs = int(std::lround(std::clamp(m_trackGapSec, 0.0, 10.0) * 1000.0));
+    if (!m_gapless && gapMs > 0 && m_queue.upcoming()) {
+        m_playPauseItem->setPlaying(false);
+        m_panel->setPlaying(false);
+        m_coverItem->setPlaybackActive(false);
+        m_gapTimer.start(gapMs);
+        return;
+    }
     if (!m_queue.advance()) {
         m_playPauseItem->setPlaying(false);
         m_panel->setPlaying(false);
@@ -2227,6 +2942,7 @@ void MainWindow::onTrackContextMenuRequested(const QPoint &pos)
         for (const Track &track : tracks)
             m_db.removeTrackFromPlaylist(m_activePlaylistId, track.id);
         presentTracks(m_db.playlistTracks(m_activePlaylistId), -1, true);
+        refreshPlaylists();
     } else if (chosen == editInfo) {
         editTrackInfo(primary);
     } else if (chosen == setCover) {
@@ -2246,17 +2962,35 @@ void MainWindow::onTrackContextMenuRequested(const QPoint &pos)
 void MainWindow::onPlaylistContextMenuRequested(const QPoint &pos)
 {
     const QModelIndex index = m_playlistView->indexAt(pos);
-    if (!index.isValid()) return;
-    const qint64 playlistId = m_playlistModel.idAt(index.row());
-    const QString name = index.data(Qt::DisplayRole).toString();
+    if (!index.isValid() || m_playlistModel.isHeader(index.row())) return;
+    const Playlist playlist = m_playlistModel.playlistAt(index.row());
+    const qint64 playlistId = playlist.id;
+    const QString name = playlist.name;
 
     QMenu menu(this);
     QAction *addTracks = menu.addAction(tr("Добавить треки…"));
     QAction *rename = menu.addAction(tr("Переименовать…"));
     QAction *setCover = menu.addAction(tr("Задать обложку плейлиста…"));
+    QMenu *categoryMenu = menu.addMenu(tr("Категория"));
+    const int shown = PlaylistModel::effectiveCategory(playlist);
+    QAction *categoryActions[4] = {};
+    const int categories[] = {3, 2, 1, 0};
+    for (int i = 0; i < 4; ++i) {
+        categoryActions[i] = categoryMenu->addAction(PlaylistModel::categoryLabel(categories[i]));
+        categoryActions[i]->setCheckable(true);
+        categoryActions[i]->setChecked(categories[i] == shown);
+        categoryActions[i]->setData(categories[i]);
+    }
+    menu.addSeparator();
     QAction *remove = menu.addAction(tr("Удалить плейлист"));
     QAction *chosen = menu.exec(m_playlistView->viewport()->mapToGlobal(pos));
     if (!chosen) return;
+    for (QAction *action : categoryActions) {
+        if (chosen != action) continue;
+        m_db.setPlaylistCategory(playlistId, action->data().toInt());
+        refreshPlaylists();
+        return;
+    }
 
     if (chosen == addTracks) {
         addTracksFromLibrary(playlistId);
@@ -2347,6 +3081,8 @@ void MainWindow::loadOrCreateDefaultSkin()
     const QJsonObject mini = layout.value(QStringLiteral("mini_bar")).toObject();
     if (!mini.isEmpty() && m_canvas) m_canvas->applyLayout(mini);
     mirrorTabLook();
+    if (m_accent.isValid()) applyAccent(m_accent);
+    syncLibraryCoverShape();
 }
 
 void MainWindow::mirrorTabLook()

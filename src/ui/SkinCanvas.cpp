@@ -392,6 +392,12 @@ void SkinCanvas::applyLayout(const QJsonObject &layout)
     if (!m_fractional && version < 2) return;
     if (layout.contains(QStringLiteral("background")))
         setBackgroundPath(layout.value(QStringLiteral("background")).toString());
+    struct SavedSize {
+        DraggableItem *item = nullptr;
+        double w = 0;
+        double h = 0;
+    };
+    QVector<SavedSize> savedSizes;
     for (auto it = m_items.constBegin(); it != m_items.constEnd(); ++it) {
         if (!layout.contains(it.key())) continue;
         const QJsonObject pos = layout.value(it.key()).toObject();
@@ -406,7 +412,8 @@ void SkinCanvas::applyLayout(const QJsonObject &layout)
         const QColor color(pos.value(QStringLiteral("color")).toString());
         if (color.isValid()) it.value()->setSkinColor(color);
         const double itemScale = pos.value(QStringLiteral("scale")).toDouble(1.0);
-        if (itemScale >= 0.35 && itemScale <= 3.0) it.value()->setItemScale(itemScale);
+        if (itemScale >= DraggableItem::kMinControlScale && itemScale <= DraggableItem::kMaxControlScale)
+            it.value()->setItemScale(itemScale);
         it.value()->setCustomIconPath(pos.value(QStringLiteral("icon")).toString());
         it.value()->setVisible(!pos.value(QStringLiteral("hidden")).toBool(false));
         if (auto *cover = dynamic_cast<CoverArtItem *>(it.value())) {
@@ -422,7 +429,13 @@ void SkinCanvas::applyLayout(const QJsonObject &layout)
         }
         const double w = pos.value(QStringLiteral("w")).toDouble(0);
         const double h = pos.value(QStringLiteral("h")).toDouble(0);
-        if (m_compact && w > 1.0 && h > 1.0) it.value()->resizeTo(w, h);
+        if (w > 1.0 && h > 1.0)
+            savedSizes.push_back(SavedSize{it.value(), w, h});
     }
+    // Restore pixels before the position pass. applyUiScale keeps a size the
+    // user already dragged, so the saved width and height are not replaced by
+    // the default formula.
+    for (const SavedSize &saved : savedSizes)
+        saved.item->resizeTo(saved.w, saved.h);
     applyFractionalPositions();
 }

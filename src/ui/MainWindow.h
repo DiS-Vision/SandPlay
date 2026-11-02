@@ -10,6 +10,9 @@
 #include <QColor>
 #include <QSplitter>
 #include <QFrame>
+#include <QTimer>
+
+class QToolButton;
 
 class QResizeEvent;
 class QCloseEvent;
@@ -18,6 +21,7 @@ class QPropertyAnimation;
 class TourShade;
 class SkinCanvas;
 class DraggableItem;
+class UpdateChecker;
 
 #include "../db/Database.h"
 #include "../audio/AudioEngine.h"
@@ -82,6 +86,12 @@ private:
     QColor m_accent{"#c9974b"};
 
     QTableView *m_trackView = nullptr;
+    // Relative column weights. Window resizes scale from these once the user has
+    // saved a layout. Until then the cover column stays at its default pixel width.
+    int m_columnWeights[TrackTableModel::ColCount] = {76, 280, 400, 84};
+    bool m_columnPreferenceSaved = false;
+    bool m_fittingColumns = false;
+    bool m_userColumnDrag = false;
     QListView *m_playlistView = nullptr;
     QLineEdit *m_searchEdit = nullptr;
     QPushButton *m_showMore = nullptr;
@@ -112,7 +122,16 @@ private:
     QString m_uiFontFamily;
     int m_uiFontSize = 10;
     int m_buttonStyle = 0;
+    UpdateChecker *m_updates = nullptr;
+    bool m_deferUpdateNotice = false;
+    bool m_updateNoticeShown = false;
+    bool m_updateNoticePending = false;
+    bool m_updateDownloadPending = false;
 
+    void restoreColumnWeights();
+    bool rememberColumnRatios();
+    void applyColumnRatios();
+    void syncLibraryCoverShape();
     void refreshTracks(const QString &search = {}, bool keepScroll = false);
     void presentTracks(const QVector<Track> &tracks, int libraryTotal, bool keepScroll);
     bool handlePlayerKey(QKeyEvent *event);
@@ -128,6 +147,9 @@ private:
     void applyAccent(const QColor &color);
     void applyWindowChrome();
     void openSettings();
+    void onUpdateChecked();
+    void showUpdateNotice();
+    void startUpdateDownload();
     void startTour();
     void showTourStep();
     void placeTour();
@@ -144,8 +166,22 @@ private:
     void deleteTracksFromDisk(const QVector<Track> &tracks);
     void adoptFirstTrackCovers();
     void addTracksFromLibrary(qint64 playlistId);
-    void openEqualizer();
+    void openEqualizer(QWidget *parent);
     void cycleRepeatMode();
     QVector<Track> selectedTracks() const;
     void addTracksToPlaylist(qint64 playlistId, const QList<qint64> &ids);
+    void armUpcoming();
+    void refreshSleepControls();
+    void openSleepMenu(QWidget *anchor);
+    void onTrackGapElapsed();
+    void onSleepTick();
+
+    bool m_gapless = false;
+    double m_trackGapSec = 0;
+    bool m_stopAfterTrack = false;
+    int m_sleepMinutes = 0;
+    qint64 m_sleepEndsAtMs = 0;
+    QTimer m_gapTimer;
+    QTimer m_sleepTicker;
+    QToolButton *m_sleepButton = nullptr;
 };

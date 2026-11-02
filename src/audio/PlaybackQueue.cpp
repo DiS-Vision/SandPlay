@@ -166,6 +166,24 @@ std::optional<Track> PlaybackQueue::current() const
     return m_tracks[m_currentIndex];
 }
 
+std::optional<Track> PlaybackQueue::upcoming() const
+{
+    if (m_tracks.isEmpty() || m_currentIndex < 0 || m_currentIndex >= m_tracks.size())
+        return std::nullopt;
+    if (m_repeatMode == RepeatMode::RepeatOne)
+        return current();
+
+    const int shufflePos = shufflePositionOf(m_currentIndex);
+    if (shufflePos < 0) return std::nullopt;
+    const int nextPos = shufflePos + 1;
+    if (nextPos >= m_shuffleOrder.size()) {
+        if (m_repeatMode == RepeatMode::RepeatAll && !m_shuffleOrder.isEmpty())
+            return m_tracks[m_shuffleOrder.first()];
+        return std::nullopt;
+    }
+    return m_tracks[m_shuffleOrder[nextPos]];
+}
+
 std::optional<Track> PlaybackQueue::advance()
 {
     if (m_tracks.isEmpty()) return std::nullopt;

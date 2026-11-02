@@ -1,4 +1,5 @@
 #pragma once
+#include <QElapsedTimer>
 #include <QObject>
 #include <QTimer>
 #include <QString>
@@ -29,6 +30,12 @@ public:
     int sampleRate() const { return m_sampleRate; }
     int bitDepth() const { return m_bitDepth; }
     bool loadAndPlay(const QString &path);
+    // When on, the following track is opened in a second streamed sound and
+    // started on the engine clock at the last frame of the current one.
+    void setGapless(bool on);
+    void prepareNext(const QString &path);
+    void clearNext();
+    QString loadedPath() const { return m_loadedPath; }
     void pause();
     void resume();
     void stop();
@@ -49,7 +56,7 @@ public:
 
 signals:
     void positionChanged(qint64 ms);     // emitted ~4x/sec while playing
-    void trackFinished();                // reached end of stream — PlaybackQueue advances
+    void trackFinished();                // current track ended; gapless may already be inside the next one
     void playbackStateChanged(bool playing);
     void errorOccurred(const QString &message);
 
@@ -62,11 +69,18 @@ private:
     bool initCustom();
     bool attachEqualizer();
     void restorePlayback(const QString &path, qint64 positionMs, bool playing);
+    void scheduleNext(bool rewind);
+    void adoptNext(bool markHandoff);
+    void uninitSlot(int slot);
+    bool openSlot(int slot, const QString &path);
+    void attachSound(ma_sound *sound);
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     QTimer m_pollTimer;
+    QElapsedTimer m_boundaryWait;
     bool m_wasAtEnd = false;
+    bool m_seamlessHandoff = false;
     float m_volume = 0.8f;
     int m_sampleRate = 0;
     int m_bitDepth = 0;

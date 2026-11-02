@@ -18,9 +18,16 @@
 #include <QIcon>
 #include <QFont>
 #include <QFrame>
+#include <QGraphicsBlurEffect>
+#include <QGraphicsPixmapItem>
+#include <QGraphicsScene>
+#include <QImage>
+#include <QLinearGradient>
 #include <QPaintEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPalette>
+#include <QSizePolicy>
 #include <QResizeEvent>
 #include <QToolButton>
 #include <QSplitter>
@@ -279,6 +286,174 @@ public:
     }
 };
 
+QImage frostBlur(const QImage &source)
+{
+    if (source.isNull() || source.width() < 2 || source.height() < 2)
+        return source;
+    constexpr int kMaxEdge = 420;
+    const int edge = std::max(source.width(), source.height());
+    const qreal factor = edge > kMaxEdge ? qreal(kMaxEdge) / qreal(edge) : 1.0;
+    QImage small = source;
+    if (factor < 0.999) {
+        small = source.scaled(std::max(1, int(std::lround(source.width() * factor))),
+                               std::max(1, int(std::lround(source.height() * factor))),
+                               Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    }
+    const qreal radius = std::max(6.0, 18.0 * factor);
+    const int pad = std::max(2, int(std::ceil(radius)) * 2);
+    QImage padded(small.width() + pad * 2, small.height() + pad * 2, QImage::Format_ARGB32_Premultiplied);
+    padded.fill(Qt::transparent);
+    {
+        QPainter painter(&padded);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        painter.drawImage(QRect(0, 0, padded.width(), padded.height()), small);
+        painter.drawImage(pad, pad, small);
+    }
+
+    QImage cropped;
+    {
+        // The scene deletes items it still owns. This pixmap item is on the stack,
+        // so it has to leave the scene before either destructor runs.
+        QGraphicsPixmapItem item(QPixmap::fromImage(padded));
+        auto *effect = new QGraphicsBlurEffect;
+        effect->setBlurRadius(radius);
+        effect->setBlurHints(QGraphicsBlurEffect::PerformanceHint);
+        item.setGraphicsEffect(effect);
+        QGraphicsScene scene;
+        scene.addItem(&item);
+
+        QImage blurred(padded.size(), QImage::Format_ARGB32_Premultiplied);
+        blurred.fill(Qt::transparent);
+        QPainter painter(&blurred);
+        const QRectF sourceRect = item.mapRectToScene(item.boundingRect());
+        scene.render(&painter, QRectF(blurred.rect()), sourceRect, Qt::IgnoreAspectRatio);
+        painter.end();
+        scene.removeItem(&item);
+        cropped = blurred.copy(pad, pad, small.width(), small.height());
+    }
+    if (cropped.isNull())
+        return source;
+    if (qAlpha(cropped.pixel(cropped.width() / 2, cropped.height() / 2)) < 16)
+        return source;
+    if (cropped.size() == source.size())
+        return cropped;
+    return cropped.scaled(source.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+}
+
+// Rounded queue plate. The blur is rebuilt when the photo changes or the card
+// resizes, never on a timer.
+class FrostedQueueCard : public QFrame {
+public:
+    FrostedQueueCard()
+    {
+        setObjectName(QStringLiteral("queueCard"));
+        setFrameShape(QFrame::NoFrame);
+        setAttribute(Qt::WA_StyledBackground, false);
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAutoFillBackground(false);
+    }
+
+    void bind(QWidget *space, QWidget *photoHost)
+    {
+        m_space = space;
+        m_photoHost = photoHost;
+        rebuild();
+    }
+
+    void setPhoto(const QPixmap &photo, bool hasPhoto)
+    {
+        m_photo = photo;
+        m_hasPhoto = hasPhoto && !photo.isNull();
+        rebuild();
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QFrame::resizeEvent(event);
+        rebuild();
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        QPainterPath path;
+        const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+        path.addRoundedRect(box, 18, 18);
+        painter.setClipPath(path);
+        if (!m_blurred.isNull())
+            painter.drawPixmap(rect(), m_blurred);
+        painter.fillPath(path, QColor(12, 14, 20, 72));
+        painter.setClipping(false);
+        painter.setPen(QPen(QColor(255, 255, 255, 36), 1.0));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(box, 18, 18);
+    }
+
+private:
+    void rebuild()
+    {
+        if (width() < 4 || height() < 4)
+            return;
+        QRect placed;
+        QRect cardOnSpace;
+        if (m_space && m_photoHost && m_photoHost->parentWidget() == m_space) {
+            placed = m_photoHost->geometry();
+            cardOnSpace = QRect(mapTo(m_space, QPoint(0, 0)), size());
+        }
+        const qint64 photoKey = m_photo.isNull() ? 0 : m_photo.cacheKey();
+        if (m_valid && m_cachedSize == size() && m_cachedKey == photoKey && m_cachedPhoto == m_hasPhoto
+            && m_cachedPlaced == placed && m_cachedCard == cardOnSpace)
+            return;
+
+        const QColor panel(QStringLiteral("#181b22"));
+        const QColor dark(panel.red() * 58 / 100, panel.green() * 58 / 100, panel.blue() * 58 / 100);
+        QImage sample(size(), QImage::Format_ARGB32_Premultiplied);
+        sample.fill(dark);
+        {
+            QPainter painter(&sample);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform);
+            if (m_hasPhoto && !m_photo.isNull() && placed.width() > 1 && placed.height() > 1) {
+                const qreal sx = m_photo.width() / qreal(placed.width());
+                const qreal sy = m_photo.height() / qreal(placed.height());
+                const QPointF local = cardOnSpace.topLeft() - placed.topLeft();
+                const QRectF source(local.x() * sx, local.y() * sy,
+                                    qreal(cardOnSpace.width()) * sx, qreal(cardOnSpace.height()) * sy);
+                painter.drawPixmap(QRectF(sample.rect()), m_photo, source);
+                painter.fillRect(sample.rect(), QColor(0, 0, 0, 110));
+            } else {
+                QLinearGradient shade(0, 0, sample.width(), sample.height());
+                shade.setColorAt(0.0, panel.darker(112));
+                shade.setColorAt(1.0, dark);
+                painter.fillRect(sample.rect(), shade);
+            }
+        }
+        const QImage blurred = frostBlur(sample);
+        m_blurred = QPixmap::fromImage(blurred.isNull() ? sample : blurred);
+        m_valid = true;
+        m_cachedSize = size();
+        m_cachedKey = photoKey;
+        m_cachedPhoto = m_hasPhoto;
+        m_cachedPlaced = placed;
+        m_cachedCard = cardOnSpace;
+        update();
+    }
+
+    QWidget *m_space = nullptr;
+    QWidget *m_photoHost = nullptr;
+    QPixmap m_photo;
+    QPixmap m_blurred;
+    bool m_hasPhoto = false;
+    bool m_valid = false;
+    QSize m_cachedSize;
+    qint64 m_cachedKey = 0;
+    bool m_cachedPhoto = false;
+    QRect m_cachedPlaced;
+    QRect m_cachedCard;
+};
+
 } // namespace
 
 PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
@@ -297,7 +472,7 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
 
     m_coverStatus = new QLabel;
     m_coverStatus->setStyleSheet(QStringLiteral("color: #8b8a86; background: transparent;"));
-    m_editHint = new QLabel(tr("Угол кнопки и обложки меняет размер пропорционально. Правый клик: текстура, рамка, фон."));
+    m_editHint = new QLabel(tr("Угол меняет размер: обложка и воспроизведение сохраняют пропорции, остальные кнопки тянутся свободно. Правый клик: текстура, рамка, фон."));
     m_editHint->setStyleSheet(QStringLiteral("color: #c9974b; background: transparent;"));
     m_editHint->hide();
 
@@ -346,7 +521,7 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     m_canvas->registerFractionalItem(m_volumeBar, {0.72, 0.80});
 
     m_queueTitle = new QLabel(tr("Очередь"));
-    m_queueTitle->setStyleSheet(QStringLiteral("font-weight: 700; background: transparent;"));
+    m_queueTitle->setStyleSheet(QStringLiteral("font-weight: 700; color: #f3efe6; background: transparent;"));
     auto *queueView = new QueueListView;
     m_queueView = queueView;
     m_queueView->setModel(&m_queueModel);
@@ -365,6 +540,8 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     QPalette queuePalette = m_queueView->palette();
     queuePalette.setColor(QPalette::Highlight, QColor(QStringLiteral("#3a3428")));
     queuePalette.setColor(QPalette::HighlightedText, QColor(QStringLiteral("#f3efe6")));
+    queuePalette.setColor(QPalette::Base, Qt::transparent);
+    queuePalette.setColor(QPalette::Window, Qt::transparent);
     m_queueView->setPalette(queuePalette);
     m_queueView->viewport()->setPalette(queuePalette);
     m_queueView->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -372,23 +549,32 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     m_queueView->viewport()->setAutoFillBackground(false);
     m_queueEmpty = new QLabel(tr("Очередь пуста. Дважды щёлкните трек в библиотеке или перетащите его сюда."));
     m_queueEmpty->setWordWrap(true);
-    m_queueEmpty->setStyleSheet(QStringLiteral("color: #8b8a86; background: transparent;"));
+    m_queueEmpty->setStyleSheet(QStringLiteral("color: #d5d0c6; background: transparent;"));
 
-    auto *queueCard = new QFrame;
-    queueCard->setObjectName(QStringLiteral("queueCard"));
-    queueCard->setAttribute(Qt::WA_StyledBackground, true);
+    auto *queueCard = new FrostedQueueCard;
+    m_queueCard = queueCard;
     auto *queueLayout = new QVBoxLayout(queueCard);
-    queueLayout->setContentsMargins(12, 12, 12, 12);
+    queueLayout->setContentsMargins(18, 18, 18, 18);
     queueLayout->setSpacing(8);
     queueLayout->addWidget(m_queueTitle);
     queueLayout->addWidget(m_queueView, 1);
     queueLayout->addWidget(m_queueEmpty);
     m_queueView->hide();
+    m_sleepButton = new QToolButton;
+    m_sleepButton->setObjectName(QStringLiteral("sleepTimer"));
+    m_sleepButton->setText(tr("Таймер"));
+    m_sleepButton->setCursor(Qt::PointingHandCursor);
+    m_sleepButton->setFocusPolicy(Qt::NoFocus);
+    m_sleepButton->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    m_sleepButton->setMinimumWidth(0);
+    m_sleepButton->setMinimumHeight(36);
     m_queuePane = new QWidget;
     m_queuePane->setObjectName(QStringLiteral("playerQueue"));
     auto *paneLayout = new QVBoxLayout(m_queuePane);
     paneLayout->setContentsMargins(8, 12, 14, 16);
-    paneLayout->addWidget(queueCard);
+    paneLayout->setSpacing(8);
+    paneLayout->addWidget(queueCard, 1);
+    paneLayout->addWidget(m_sleepButton);
     m_queuePane->setMinimumWidth(180);
 
     m_split = new QSplitter;
@@ -415,6 +601,7 @@ PlayerPanel::PlayerPanel(QWidget *parent) : QWidget(parent)
     grid->addWidget(topBar, 0, 1);
     grid->addWidget(leftGutter, 1, 0);
     grid->addWidget(m_split, 1, 1);
+    queueCard->bind(this, m_split);
 
     queueView->onReorder = [this](int from, int to) { emit queueReordered(from, to); };
     queueView->onTracksDropped = [this](int row, const QList<qint64> &ids) {
@@ -491,12 +678,8 @@ void PlayerPanel::syncBackdrop()
     if (!m_canvas) return;
     const bool shared = m_canvas->hasBackground() && m_canvas->parentWidget() == m_split;
     m_canvas->setClearBackdrop(shared);
-    if (QWidget *card = findChild<QWidget *>(QStringLiteral("queueCard"))) {
-        card->setProperty("photo", shared);
-        card->style()->unpolish(card);
-        card->style()->polish(card);
-        card->update();
-    }
+    if (auto *card = static_cast<FrostedQueueCard *>(m_queueCard))
+        card->setPhoto(shared ? m_canvas->backgroundPixmap() : QPixmap(), shared);
     update();
 }
 
@@ -604,7 +787,11 @@ void PlayerPanel::setAccent(const QColor &color)
 {
     if (!color.isValid()) return;
     m_accent = color;
-    m_canvas->applyAccent(color);
+    if (m_canvas) m_canvas->applyAccent(color);
+    if (m_play) {
+        m_play->clearSkinColor();
+        m_play->setAccent(color);
+    }
 }
 
 void PlayerPanel::setQueue(const QVector<Track> &tracks, int currentIndex)
