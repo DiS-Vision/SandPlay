@@ -7,7 +7,7 @@
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SandPlay.iss
 
 #define MyAppName "SandPlay"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "DiS-Vision"
 #define MyAppURL "https://github.com/DiS-Vision/SandPlay"
 #define MyAppExeName "SandPlay.exe"
@@ -22,8 +22,8 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases
-VersionInfoVersion=0.1.0.0
-VersionInfoProductVersion=0.1.0.0
+VersionInfoVersion=0.2.0.0
+VersionInfoProductVersion=0.2.0.0
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -51,8 +51,8 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 russian.CreateStartMenuIcon=Ярлык в меню «Пуск»
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checked
-Name: "startmenuicon"; Description: "{cm:CreateStartMenuIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "startmenuicon"; Description: "{cm:CreateStartMenuIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "{#DeployDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
